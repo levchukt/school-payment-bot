@@ -82,6 +82,23 @@ def ensure_default_settings():
         set_setting("last_auto_reminder_date", "")
 
 
+def get_main_menu_markup() -> ReplyKeyboardMarkup:
+    keyboard = [
+        ["Учні", "Групи"],
+        ["Оплати", "Уроки"],
+        ["Нагадування", "Швидкі дії"],
+        ["Пошук і фільтри"],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def get_cancel_markup() -> ReplyKeyboardMarkup:
+    keyboard = [
+        ["Скасувати", "Назад"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
 def normalize_weekday(day_text: str) -> int | None:
     if not day_text:
         return None
@@ -256,18 +273,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     set_setting("admin_chat_id", str(chat_id))
 
-    keyboard = [
-        ["Учні", "Групи"],
-        ["Оплати", "Уроки"],
-        ["Нагадування", "Швидкі дії"],
-        ["Пошук і фільтри"],
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
     await update.message.reply_text(
         "Бот запущено. Обери розділ:",
-        reply_markup=reply_markup
+        reply_markup=get_main_menu_markup()
     )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Дію скасовано.",
+        reply_markup=get_main_menu_markup()
+    )
+    return ConversationHandler.END
 
 
 async def groups_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,19 +385,28 @@ async def search_filters_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введи назву групи:")
+    await update.message.reply_text(
+        "Введи назву групи:",
+        reply_markup=get_cancel_markup()
+    )
     return GROUP_NAME
 
 
 async def add_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["group_name"] = update.message.text
-    await update.message.reply_text("Введи день занять (наприклад: Понеділок):")
+    await update.message.reply_text(
+        "Введи день занять (наприклад: Понеділок):",
+        reply_markup=get_cancel_markup()
+    )
     return GROUP_DAY
 
 
 async def add_group_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["group_day"] = update.message.text
-    await update.message.reply_text("Введи час занять (наприклад: 16:00):")
+    await update.message.reply_text(
+        "Введи час занять (наприклад: 16:00):",
+        reply_markup=get_cancel_markup()
+    )
     return GROUP_TIME
 
 
@@ -390,7 +417,10 @@ async def add_group_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     create_group(name, day, time)
 
-    await update.message.reply_text(f"Група створена:\n{name} — {day} {time}")
+    await update.message.reply_text(
+        f"Група створена:\n{name} — {day} {time}",
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -412,7 +442,7 @@ async def add_student_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         ["Індивідуальний"],
         ["У групу"],
-        ["Назад"]
+        ["Скасувати", "Назад"]
     ]
     await update.message.reply_text(
         "Оберіть тип учня:",
@@ -426,19 +456,27 @@ async def add_student_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if student_type == "Індивідуальний":
         context.user_data["student_type"] = "individual"
-        await update.message.reply_text("Введи ім'я учня:")
+        await update.message.reply_text(
+            "Введи ім'я учня:",
+            reply_markup=get_cancel_markup()
+        )
         return STUDENT_NAME
 
     if student_type == "У групу":
         context.user_data["student_type"] = "group"
-        await update.message.reply_text("Введи ім'я учня:")
+        await update.message.reply_text(
+            "Введи ім'я учня:",
+            reply_markup=get_cancel_markup()
+        )
         return STUDENT_NAME
 
-    if student_type == "Назад":
-        await start(update, context)
-        return ConversationHandler.END
+    if student_type in ("Назад", "Скасувати"):
+        return await cancel(update, context)
 
-    await update.message.reply_text("Оберіть варіант кнопкою.")
+    await update.message.reply_text(
+        "Оберіть варіант кнопкою.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[["Індивідуальний"], ["У групу"], ["Скасувати", "Назад"]], resize_keyboard=True)
+    )
     return STUDENT_TYPE
 
 
@@ -447,25 +485,37 @@ async def add_student_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     student_type = context.user_data["student_type"]
 
     if student_type == "individual":
-        await update.message.reply_text("Введи день занять:")
+        await update.message.reply_text(
+            "Введи день занять:",
+            reply_markup=get_cancel_markup()
+        )
         return STUDENT_DAY
 
     groups = get_all_groups()
     if not groups:
-        await update.message.reply_text("Спочатку створи хоча б одну групу.")
+        await update.message.reply_text(
+            "Спочатку створи хоча б одну групу.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Оберіть групу за ID:\n\n"
     for g in groups:
         text += f"{g['id']}. {g['name']} — {g['lesson_day']} {g['lesson_time']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return STUDENT_GROUP
 
 
 async def add_student_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["student_day"] = update.message.text
-    await update.message.reply_text("Введи час занять:")
+    await update.message.reply_text(
+        "Введи час занять:",
+        reply_markup=get_cancel_markup()
+    )
     return STUDENT_TIME
 
 
@@ -475,7 +525,10 @@ async def add_student_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["student_day"],
         update.message.text
     )
-    await update.message.reply_text("Індивідуального учня створено.")
+    await update.message.reply_text(
+        "Індивідуального учня створено.",
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -483,18 +536,27 @@ async def add_student_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         group_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID групи.")
+        await update.message.reply_text(
+            "Введи числовий ID групи.",
+            reply_markup=get_cancel_markup()
+        )
         return STUDENT_GROUP
 
     groups = get_all_groups()
     valid_group_ids = [g["id"] for g in groups]
 
     if group_id not in valid_group_ids:
-        await update.message.reply_text("Такої групи немає.")
+        await update.message.reply_text(
+            "Такої групи немає.",
+            reply_markup=get_cancel_markup()
+        )
         return STUDENT_GROUP
 
     create_group_student(context.user_data["student_name"], group_id)
-    await update.message.reply_text("Учня додано в групу.")
+    await update.message.reply_text(
+        "Учня додано в групу.",
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -516,14 +578,20 @@ async def show_student_card_start(update: Update, context: ContextTypes.DEFAULT_
     students = get_all_students()
 
     if not students:
-        await update.message.reply_text("Учнів поки немає.")
+        await update.message.reply_text(
+            "Учнів поки немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID учня для перегляду картки:\n\n"
     for s in students:
         text += f"{s['id']}. {s['name']} | Залишок: {s['remaining_lessons']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return CARD_STUDENT_ID
 
 
@@ -531,12 +599,18 @@ async def show_student_card_finish(update: Update, context: ContextTypes.DEFAULT
     try:
         student_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID учня.")
+        await update.message.reply_text(
+            "Введи числовий ID учня.",
+            reply_markup=get_cancel_markup()
+        )
         return CARD_STUDENT_ID
 
     student = get_student_by_id(student_id)
     if not student:
-        await update.message.reply_text("Учня не знайдено.")
+        await update.message.reply_text(
+            "Учня не знайдено.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = f"Картка учня:\n\nID: {student['id']}\nІм'я: {student['name']}\nТип: {student['student_type']}\nСтатус: {'Активний' if student['is_active'] == 1 else 'Неактивний'}\n"
@@ -551,7 +625,10 @@ async def show_student_card_finish(update: Update, context: ContextTypes.DEFAULT
     text += f"Остання оплата: {student['last_payment_date'] or '—'}\n"
     text += f"Нотатки: {student['notes'] or '—'}"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -559,14 +636,20 @@ async def student_history_start(update: Update, context: ContextTypes.DEFAULT_TY
     students = get_all_students(include_inactive=True)
 
     if not students:
-        await update.message.reply_text("Учнів поки немає.")
+        await update.message.reply_text(
+            "Учнів поки немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID учня для перегляду історії оплат:\n\n"
     for s in students:
         text += f"{s['id']}. {s['name']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return HISTORY_STUDENT_ID
 
 
@@ -574,17 +657,26 @@ async def student_history_finish(update: Update, context: ContextTypes.DEFAULT_T
     try:
         student_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID учня.")
+        await update.message.reply_text(
+            "Введи числовий ID учня.",
+            reply_markup=get_cancel_markup()
+        )
         return HISTORY_STUDENT_ID
 
     student = get_student_by_id(student_id)
     if not student:
-        await update.message.reply_text("Учня не знайдено.")
+        await update.message.reply_text(
+            "Учня не знайдено.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     payments = get_payments_by_student(student_id)
     if not payments:
-        await update.message.reply_text(f"По учню {student['name']} оплат поки немає.")
+        await update.message.reply_text(
+            f"По учню {student['name']} оплат поки немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = f"Історія оплат: {student['name']}\n\n"
@@ -595,7 +687,10 @@ async def student_history_finish(update: Update, context: ContextTypes.DEFAULT_T
             f"Уроків: {payment['lessons_paid']}\n"
         )
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -603,14 +698,20 @@ async def deactivate_student_start(update: Update, context: ContextTypes.DEFAULT
     students = get_all_students()
 
     if not students:
-        await update.message.reply_text("Активних учнів немає.")
+        await update.message.reply_text(
+            "Активних учнів немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID учня для деактивації:\n\n"
     for s in students:
         text += f"{s['id']}. {s['name']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return DEACTIVATE_STUDENT_ID
 
 
@@ -618,16 +719,25 @@ async def deactivate_student_finish(update: Update, context: ContextTypes.DEFAUL
     try:
         student_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID учня.")
+        await update.message.reply_text(
+            "Введи числовий ID учня.",
+            reply_markup=get_cancel_markup()
+        )
         return DEACTIVATE_STUDENT_ID
 
     student = get_student_by_id(student_id)
     if not student or student["is_active"] == 0:
-        await update.message.reply_text("Учня не знайдено.")
+        await update.message.reply_text(
+            "Учня не знайдено.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     deactivate_student(student_id)
-    await update.message.reply_text(f"Учня {student['name']} деактивовано.")
+    await update.message.reply_text(
+        f"Учня {student['name']} деактивовано.",
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -635,14 +745,20 @@ async def update_balance_start(update: Update, context: ContextTypes.DEFAULT_TYP
     students = get_all_students()
 
     if not students:
-        await update.message.reply_text("Активних учнів немає.")
+        await update.message.reply_text(
+            "Активних учнів немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID учня для зміни балансу:\n\n"
     for s in students:
         text += f"{s['id']}. {s['name']} | Поточний залишок: {s['remaining_lessons']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return BALANCE_STUDENT_ID
 
 
@@ -650,19 +766,26 @@ async def update_balance_student(update: Update, context: ContextTypes.DEFAULT_T
     try:
         student_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID учня.")
+        await update.message.reply_text(
+            "Введи числовий ID учня.",
+            reply_markup=get_cancel_markup()
+        )
         return BALANCE_STUDENT_ID
 
     student = get_student_by_id(student_id)
     if not student or student["is_active"] == 0:
-        await update.message.reply_text("Учня не знайдено.")
+        await update.message.reply_text(
+            "Учня не знайдено.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     context.user_data["balance_student_id"] = student_id
     context.user_data["balance_student_name"] = student["name"]
 
     await update.message.reply_text(
-        f"Введи новий баланс для {student['name']}.\nМожна вводити від'ємні значення."
+        f"Введи новий баланс для {student['name']}.\nМожна вводити від'ємні значення.",
+        reply_markup=get_cancel_markup()
     )
     return BALANCE_NEW_VALUE
 
@@ -671,7 +794,10 @@ async def update_balance_finish(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         new_balance = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи ціле число.")
+        await update.message.reply_text(
+            "Введи ціле число.",
+            reply_markup=get_cancel_markup()
+        )
         return BALANCE_NEW_VALUE
 
     student_id = context.user_data["balance_student_id"]
@@ -679,7 +805,8 @@ async def update_balance_finish(update: Update, context: ContextTypes.DEFAULT_TY
 
     update_student_balance(student_id, new_balance)
     await update.message.reply_text(
-        f"Баланс оновлено.\nУчень: {student_name}\nНовий залишок: {new_balance}"
+        f"Баланс оновлено.\nУчень: {student_name}\nНовий залишок: {new_balance}",
+        reply_markup=get_main_menu_markup()
     )
     return ConversationHandler.END
 
@@ -689,18 +816,27 @@ async def move_student_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     groups = get_all_groups()
 
     if not students:
-        await update.message.reply_text("Активних учнів немає.")
+        await update.message.reply_text(
+            "Активних учнів немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     if not groups:
-        await update.message.reply_text("Спочатку створи хоча б одну групу.")
+        await update.message.reply_text(
+            "Спочатку створи хоча б одну групу.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID учня для переведення в групу:\n\n"
     for s in students:
         text += f"{s['id']}. {s['name']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return MOVE_STUDENT_ID
 
 
@@ -708,12 +844,18 @@ async def move_student_choose_student(update: Update, context: ContextTypes.DEFA
     try:
         student_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID учня.")
+        await update.message.reply_text(
+            "Введи числовий ID учня.",
+            reply_markup=get_cancel_markup()
+        )
         return MOVE_STUDENT_ID
 
     student = get_student_by_id(student_id)
     if not student or student["is_active"] == 0:
-        await update.message.reply_text("Учня не знайдено.")
+        await update.message.reply_text(
+            "Учня не знайдено.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     context.user_data["move_student_id"] = student_id
@@ -724,7 +866,10 @@ async def move_student_choose_student(update: Update, context: ContextTypes.DEFA
     for g in groups:
         text += f"{g['id']}. {g['name']} | {g['lesson_day']} {g['lesson_time']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return MOVE_GROUP_ID
 
 
@@ -732,14 +877,20 @@ async def move_student_choose_group(update: Update, context: ContextTypes.DEFAUL
     try:
         group_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID групи.")
+        await update.message.reply_text(
+            "Введи числовий ID групи.",
+            reply_markup=get_cancel_markup()
+        )
         return MOVE_GROUP_ID
 
     groups = get_all_groups()
     valid_group_ids = [g["id"] for g in groups]
 
     if group_id not in valid_group_ids:
-        await update.message.reply_text("Такої групи немає.")
+        await update.message.reply_text(
+            "Такої групи немає.",
+            reply_markup=get_cancel_markup()
+        )
         return MOVE_GROUP_ID
 
     student_id = context.user_data["move_student_id"]
@@ -749,7 +900,8 @@ async def move_student_choose_group(update: Update, context: ContextTypes.DEFAUL
     group_name = next(g["name"] for g in groups if g["id"] == group_id)
 
     await update.message.reply_text(
-        f"Учня переведено в групу.\nУчень: {student_name}\nГрупа: {group_name}"
+        f"Учня переведено в групу.\nУчень: {student_name}\nГрупа: {group_name}",
+        reply_markup=get_main_menu_markup()
     )
     return ConversationHandler.END
 
@@ -758,14 +910,20 @@ async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     students = get_all_students()
 
     if not students:
-        await update.message.reply_text("Активних учнів немає.")
+        await update.message.reply_text(
+            "Активних учнів немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID учня для зміни розкладу:\n\n"
     for s in students:
         text += f"{s['id']}. {s['name']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return SCHEDULE_STUDENT_ID
 
 
@@ -773,24 +931,36 @@ async def schedule_choose_student(update: Update, context: ContextTypes.DEFAULT_
     try:
         student_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID учня.")
+        await update.message.reply_text(
+            "Введи числовий ID учня.",
+            reply_markup=get_cancel_markup()
+        )
         return SCHEDULE_STUDENT_ID
 
     student = get_student_by_id(student_id)
     if not student or student["is_active"] == 0:
-        await update.message.reply_text("Учня не знайдено.")
+        await update.message.reply_text(
+            "Учня не знайдено.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     context.user_data["schedule_student_id"] = student_id
     context.user_data["schedule_student_name"] = student["name"]
 
-    await update.message.reply_text("Введи новий день занять:")
+    await update.message.reply_text(
+        "Введи новий день занять:",
+        reply_markup=get_cancel_markup()
+    )
     return SCHEDULE_DAY
 
 
 async def schedule_choose_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["schedule_day"] = update.message.text
-    await update.message.reply_text("Введи новий час занять:")
+    await update.message.reply_text(
+        "Введи новий час занять:",
+        reply_markup=get_cancel_markup()
+    )
     return SCHEDULE_TIME
 
 
@@ -803,7 +973,8 @@ async def schedule_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_individual_schedule(student_id, lesson_day, lesson_time)
 
     await update.message.reply_text(
-        f"Розклад оновлено.\nУчень: {student_name}\nНовий розклад: {lesson_day} {lesson_time}"
+        f"Розклад оновлено.\nУчень: {student_name}\nНовий розклад: {lesson_day} {lesson_time}",
+        reply_markup=get_main_menu_markup()
     )
     return ConversationHandler.END
 
@@ -812,14 +983,20 @@ async def add_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     students = get_all_students()
 
     if not students:
-        await update.message.reply_text("Спочатку потрібно створити хоча б одного учня.")
+        await update.message.reply_text(
+            "Спочатку потрібно створити хоча б одного учня.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID учня для додавання оплати:\n\n"
     for s in students:
         text += format_student_line(s) + "\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return PAYMENT_STUDENT_ID
 
 
@@ -827,18 +1004,27 @@ async def add_payment_student_id(update: Update, context: ContextTypes.DEFAULT_T
     try:
         student_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID учня.")
+        await update.message.reply_text(
+            "Введи числовий ID учня.",
+            reply_markup=get_cancel_markup()
+        )
         return PAYMENT_STUDENT_ID
 
     students = get_all_students()
     valid_ids = [s["id"] for s in students]
 
     if student_id not in valid_ids:
-        await update.message.reply_text("Такого учня немає.")
+        await update.message.reply_text(
+            "Такого учня немає.",
+            reply_markup=get_cancel_markup()
+        )
         return PAYMENT_STUDENT_ID
 
     context.user_data["payment_student_id"] = student_id
-    await update.message.reply_text("Введи суму оплати:")
+    await update.message.reply_text(
+        "Введи суму оплати:",
+        reply_markup=get_cancel_markup()
+    )
     return PAYMENT_AMOUNT
 
 
@@ -846,15 +1032,24 @@ async def add_payment_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         amount = float(update.message.text.replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Введи коректну суму.")
+        await update.message.reply_text(
+            "Введи коректну суму.",
+            reply_markup=get_cancel_markup()
+        )
         return PAYMENT_AMOUNT
 
     if amount <= 0:
-        await update.message.reply_text("Сума має бути більшою за 0.")
+        await update.message.reply_text(
+            "Сума має бути більшою за 0.",
+            reply_markup=get_cancel_markup()
+        )
         return PAYMENT_AMOUNT
 
     context.user_data["payment_amount"] = amount
-    await update.message.reply_text("Введи кількість оплачених уроків:")
+    await update.message.reply_text(
+        "Введи кількість оплачених уроків:",
+        reply_markup=get_cancel_markup()
+    )
     return PAYMENT_LESSONS
 
 
@@ -862,11 +1057,17 @@ async def add_payment_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         lessons_paid = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи ціле число уроків.")
+        await update.message.reply_text(
+            "Введи ціле число уроків.",
+            reply_markup=get_cancel_markup()
+        )
         return PAYMENT_LESSONS
 
     if lessons_paid <= 0:
-        await update.message.reply_text("Кількість уроків має бути більшою за 0.")
+        await update.message.reply_text(
+            "Кількість уроків має бути більшою за 0.",
+            reply_markup=get_cancel_markup()
+        )
         return PAYMENT_LESSONS
 
     student_id = context.user_data["payment_student_id"]
@@ -876,7 +1077,10 @@ async def add_payment_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE
     student = next((s for s in students if s["id"] == student_id), None)
 
     if not student:
-        await update.message.reply_text("Учня не знайдено.")
+        await update.message.reply_text(
+            "Учня не знайдено.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     add_payment(student_id, amount, lessons_paid)
@@ -887,7 +1091,8 @@ async def add_payment_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Учень: {student['name']}\n"
         f"Сума: {amount}\n"
         f"Уроків додано: {lessons_paid}\n"
-        f"Новий залишок: {new_balance}"
+        f"Новий залишок: {new_balance}",
+        reply_markup=get_main_menu_markup()
     )
     return ConversationHandler.END
 
@@ -937,14 +1142,20 @@ async def start_individual_lesson(update: Update, context: ContextTypes.DEFAULT_
     students = get_individual_students()
 
     if not students:
-        await update.message.reply_text("Індивідуальних учнів поки немає.")
+        await update.message.reply_text(
+            "Індивідуальних учнів поки немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID учня для проведення уроку:\n\n"
     for s in students:
         text += f"{s['id']}. {s['name']} | {s['lesson_day']} {s['lesson_time']} | Залишок: {s['remaining_lessons']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return LESSON_INDIVIDUAL_ID
 
 
@@ -952,20 +1163,29 @@ async def lesson_individual_complete(update: Update, context: ContextTypes.DEFAU
     try:
         student_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID учня.")
+        await update.message.reply_text(
+            "Введи числовий ID учня.",
+            reply_markup=get_cancel_markup()
+        )
         return LESSON_INDIVIDUAL_ID
 
     students = get_individual_students()
     valid_ids = [s["id"] for s in students]
 
     if student_id not in valid_ids:
-        await update.message.reply_text("Такого індивідуального учня немає.")
+        await update.message.reply_text(
+            "Такого індивідуального учня немає.",
+            reply_markup=get_cancel_markup()
+        )
         return LESSON_INDIVIDUAL_ID
 
     result = complete_individual_lesson(student_id)
 
     if not result["success"]:
-        await update.message.reply_text(result["message"])
+        await update.message.reply_text(
+            result["message"],
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     extra = ""
@@ -979,7 +1199,8 @@ async def lesson_individual_complete(update: Update, context: ContextTypes.DEFAU
     await update.message.reply_text(
         f"Урок проведено.\n"
         f"Учень: {result['student_name']}\n"
-        f"Новий залишок: {result['remaining_lessons']}{extra}"
+        f"Новий залишок: {result['remaining_lessons']}{extra}",
+        reply_markup=get_main_menu_markup()
     )
     return ConversationHandler.END
 
@@ -988,14 +1209,20 @@ async def start_group_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE)
     groups = get_all_groups()
 
     if not groups:
-        await update.message.reply_text("Груп поки немає.")
+        await update.message.reply_text(
+            "Груп поки немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID групи для проведення заняття:\n\n"
     for g in groups:
         text += f"{g['id']}. {g['name']} | {g['lesson_day']} {g['lesson_time']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return LESSON_GROUP_ID
 
 
@@ -1003,20 +1230,29 @@ async def lesson_group_choose(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         group_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID групи.")
+        await update.message.reply_text(
+            "Введи числовий ID групи.",
+            reply_markup=get_cancel_markup()
+        )
         return LESSON_GROUP_ID
 
     groups = get_all_groups()
     valid_group_ids = [g["id"] for g in groups]
 
     if group_id not in valid_group_ids:
-        await update.message.reply_text("Такої групи немає.")
+        await update.message.reply_text(
+            "Такої групи немає.",
+            reply_markup=get_cancel_markup()
+        )
         return LESSON_GROUP_ID
 
     students = get_students_by_group_id(group_id)
 
     if not students:
-        await update.message.reply_text("У цій групі поки немає учнів.")
+        await update.message.reply_text(
+            "У цій групі поки немає учнів.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     context.user_data["lesson_group_id"] = group_id
@@ -1026,7 +1262,10 @@ async def lesson_group_choose(update: Update, context: ContextTypes.DEFAULT_TYPE
         text += f"{s['id']}. {s['name']} | Залишок: {s['remaining_lessons']}\n"
 
     text += "\nПриклад: 2,3,5"
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return LESSON_GROUP_PRESENT
 
 
@@ -1040,20 +1279,27 @@ async def lesson_group_present(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         present_ids = [int(x.strip()) for x in raw_input.split(",") if x.strip()]
     except ValueError:
-        await update.message.reply_text("Введи тільки ID через кому. Наприклад: 2,3,5")
+        await update.message.reply_text(
+            "Введи тільки ID через кому. Наприклад: 2,3,5",
+            reply_markup=get_cancel_markup()
+        )
         return LESSON_GROUP_PRESENT
 
     invalid_ids = [sid for sid in present_ids if sid not in valid_ids]
     if invalid_ids:
         await update.message.reply_text(
-            f"У цій групі немає учнів з ID: {', '.join(map(str, invalid_ids))}"
+            f"У цій групі немає учнів з ID: {', '.join(map(str, invalid_ids))}",
+            reply_markup=get_cancel_markup()
         )
         return LESSON_GROUP_PRESENT
 
     result = complete_group_lesson(group_id, present_ids)
 
     if not result["success"]:
-        await update.message.reply_text(result["message"])
+        await update.message.reply_text(
+            result["message"],
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = f"Групове заняття проведено.\nГрупа: {result['group_name']}\n\n"
@@ -1085,7 +1331,10 @@ async def lesson_group_present(update: Update, context: ContextTypes.DEFAULT_TYP
             elif name in result["low_balance"]:
                 text += f"- {name} — залишився 1 урок\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -1165,7 +1414,8 @@ async def auto_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_minute = get_setting("auto_reminders_minute", "00")
     await update.message.reply_text(
         f"Поточний час автонагадування: {current_hour}:{current_minute}\n"
-        f"Введи новий час у форматі HH:MM"
+        f"Введи новий час у форматі HH:MM",
+        reply_markup=get_cancel_markup()
     )
     return AUTO_TIME_VALUE
 
@@ -1178,17 +1428,26 @@ async def auto_time_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hour = int(hour_str)
         minute = int(minute_str)
     except ValueError:
-        await update.message.reply_text("Неправильний формат. Введи так: 09:30")
+        await update.message.reply_text(
+            "Неправильний формат. Введи так: 09:30",
+            reply_markup=get_cancel_markup()
+        )
         return AUTO_TIME_VALUE
 
     if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-        await update.message.reply_text("Години мають бути 0-23, хвилини 0-59.")
+        await update.message.reply_text(
+            "Години мають бути 0-23, хвилини 0-59.",
+            reply_markup=get_cancel_markup()
+        )
         return AUTO_TIME_VALUE
 
     set_setting("auto_reminders_hour", f"{hour:02d}")
     set_setting("auto_reminders_minute", f"{minute:02d}")
 
-    await update.message.reply_text(f"Час автонагадування змінено на {hour:02d}:{minute:02d}")
+    await update.message.reply_text(
+        f"Час автонагадування змінено на {hour:02d}:{minute:02d}",
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -1229,7 +1488,10 @@ async def today_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def search_student_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введи ім'я або частину імені для пошуку:")
+    await update.message.reply_text(
+        "Введи ім'я або частину імені для пошуку:",
+        reply_markup=get_cancel_markup()
+    )
     return SEARCH_NAME_QUERY
 
 
@@ -1237,13 +1499,19 @@ async def search_student_finish(update: Update, context: ContextTypes.DEFAULT_TY
     query_text = update.message.text.strip()
 
     if not query_text:
-        await update.message.reply_text("Порожній запит.")
+        await update.message.reply_text(
+            "Порожній запит.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     students = search_students_by_name(query_text)
 
     if not students:
-        await update.message.reply_text("Нічого не знайдено.")
+        await update.message.reply_text(
+            "Нічого не знайдено.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = f"Результати пошуку: {query_text}\n\n"
@@ -1262,7 +1530,10 @@ async def search_student_finish(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Залишок: {student['remaining_lessons']}\n"
             )
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -1270,14 +1541,20 @@ async def filter_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     groups = get_all_groups()
 
     if not groups:
-        await update.message.reply_text("Груп поки немає.")
+        await update.message.reply_text(
+            "Груп поки немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = "Введи ID групи:\n\n"
     for g in groups:
         text += f"{g['id']}. {g['name']} | {g['lesson_day']} {g['lesson_time']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_cancel_markup()
+    )
     return FILTER_GROUP_ID
 
 
@@ -1285,25 +1562,37 @@ async def filter_group_finish(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         group_id = int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Введи числовий ID групи.")
+        await update.message.reply_text(
+            "Введи числовий ID групи.",
+            reply_markup=get_cancel_markup()
+        )
         return FILTER_GROUP_ID
 
     group = get_group_by_id(group_id)
     if not group:
-        await update.message.reply_text("Такої групи немає.")
+        await update.message.reply_text(
+            "Такої групи немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     students = get_students_by_group_id(group_id)
 
     if not students:
-        await update.message.reply_text(f"У групі {group['name']} активних учнів немає.")
+        await update.message.reply_text(
+            f"У групі {group['name']} активних учнів немає.",
+            reply_markup=get_main_menu_markup()
+        )
         return ConversationHandler.END
 
     text = f"Учні групи {group['name']}:\n\n"
     for student in students:
         text += f"- {student['id']}. {student['name']} | Залишок: {student['remaining_lessons']}\n"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text,
+        reply_markup=get_main_menu_markup()
+    )
     return ConversationHandler.END
 
 
@@ -1376,8 +1665,14 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "Проблемні баланси":
         await problem_balances(update, context)
 
-    elif text == "Назад":
+    elif text in ("Назад", "Скасувати"):
         await start(update, context)
+
+
+def get_common_fallbacks():
+    return [
+        MessageHandler(filters.Regex("^(Скасувати|Назад)$"), cancel)
+    ]
 
 
 def main():
@@ -1402,7 +1697,7 @@ def main():
             GROUP_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_day)],
             GROUP_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_time)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     student_conv_handler = ConversationHandler(
@@ -1414,7 +1709,7 @@ def main():
             STUDENT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_student_time)],
             STUDENT_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_student_group)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     payment_conv_handler = ConversationHandler(
@@ -1427,7 +1722,7 @@ def main():
             PAYMENT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_payment_amount)],
             PAYMENT_LESSONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_payment_lessons)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     individual_lesson_conv_handler = ConversationHandler(
@@ -1438,7 +1733,7 @@ def main():
         states={
             LESSON_INDIVIDUAL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_individual_complete)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     group_lesson_conv_handler = ConversationHandler(
@@ -1450,7 +1745,7 @@ def main():
             LESSON_GROUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_group_choose)],
             LESSON_GROUP_PRESENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_group_present)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     card_handler = ConversationHandler(
@@ -1458,7 +1753,7 @@ def main():
         states={
             CARD_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, show_student_card_finish)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     history_handler = ConversationHandler(
@@ -1466,7 +1761,7 @@ def main():
         states={
             HISTORY_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, student_history_finish)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     deactivate_handler = ConversationHandler(
@@ -1474,7 +1769,7 @@ def main():
         states={
             DEACTIVATE_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, deactivate_student_finish)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     balance_handler = ConversationHandler(
@@ -1483,7 +1778,7 @@ def main():
             BALANCE_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_balance_student)],
             BALANCE_NEW_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_balance_finish)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     move_handler = ConversationHandler(
@@ -1492,7 +1787,7 @@ def main():
             MOVE_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_student_choose_student)],
             MOVE_GROUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_student_choose_group)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     schedule_handler = ConversationHandler(
@@ -1502,7 +1797,7 @@ def main():
             SCHEDULE_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_choose_day)],
             SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_finish)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     search_handler = ConversationHandler(
@@ -1510,7 +1805,7 @@ def main():
         states={
             SEARCH_NAME_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_student_finish)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     filter_group_handler = ConversationHandler(
@@ -1518,7 +1813,7 @@ def main():
         states={
             FILTER_GROUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, filter_group_finish)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     auto_time_handler = ConversationHandler(
@@ -1526,7 +1821,7 @@ def main():
         states={
             AUTO_TIME_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_time_finish)],
         },
-        fallbacks=[]
+        fallbacks=get_common_fallbacks()
     )
 
     app.add_error_handler(error_handler)
