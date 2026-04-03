@@ -63,6 +63,8 @@ MOVE_STUDENT_ID, MOVE_GROUP_ID = range(60, 62)
 SCHEDULE_STUDENT_ID, SCHEDULE_DAY, SCHEDULE_TIME = range(70, 73)
 SEARCH_NAME_QUERY, FILTER_GROUP_ID, AUTO_TIME_VALUE = range(80, 83)
 
+AUTO_REMINDER_TASK_KEY = "auto_reminder_task"
+
 
 def get_local_now() -> datetime:
     return datetime.now(TIMEZONE)
@@ -208,23 +210,36 @@ async def maybe_send_auto_reminders(app: Application):
 
 
 async def auto_reminder_loop(app: Application):
-    while True:
-        try:
-            await maybe_send_auto_reminders(app)
-        except Exception:
-            logger.exception("Помилка під час автонагадувань")
-        await asyncio.sleep(60)
+    try:
+        while True:
+            try:
+                await maybe_send_auto_reminders(app)
+            except Exception:
+                logger.exception("Помилка під час автонагадувань")
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logger.info("Фонову задачу автонагадувань зупинено")
+        raise
 
 
 async def post_init(app: Application):
     ensure_default_settings()
 
-    # ВАЖЛИВО ДЛЯ RENDER І POLLING:
-    # скидаємо webhook перед стартом polling,
-    # щоб не було Conflict: terminated by other getUpdates request
     await app.bot.delete_webhook(drop_pending_updates=True)
 
-    app.create_task(auto_reminder_loop(app))
+    auto_task = asyncio.create_task(auto_reminder_loop(app))
+    app.bot_data[AUTO_REMINDER_TASK_KEY] = auto_task
+
+
+async def post_shutdown(app: Application):
+    auto_task = app.bot_data.get(AUTO_REMINDER_TASK_KEY)
+
+    if auto_task:
+        auto_task.cancel()
+        try:
+            await auto_task
+        except asyncio.CancelledError:
+            pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1362,7 +1377,13 @@ def main():
     init_db()
     ensure_default_settings()
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     group_conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Додати групу$"), add_group_start)],
