@@ -65,6 +65,8 @@ SCHEDULE_STUDENT_ID, SCHEDULE_DAY, SCHEDULE_TIME = range(70, 73)
 SEARCH_NAME_QUERY, FILTER_GROUP_ID, AUTO_TIME_VALUE = range(80, 83)
 
 AUTO_REMINDER_TASK_KEY = "auto_reminder_task"
+CANCEL_PATTERN = r"^(Скасувати|Назад)$"
+TEXT_INPUT_FILTER = filters.TEXT & ~filters.COMMAND & ~filters.Regex(CANCEL_PATTERN)
 
 
 def get_local_now() -> datetime:
@@ -473,9 +475,14 @@ async def add_student_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if student_type in ("Назад", "Скасувати"):
         return await cancel(update, context)
 
+    keyboard = [
+        ["Індивідуальний"],
+        ["У групу"],
+        ["Скасувати", "Назад"]
+    ]
     await update.message.reply_text(
         "Оберіть варіант кнопкою.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[["Індивідуальний"], ["У групу"], ["Скасувати", "Назад"]], resize_keyboard=True)
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
     return STUDENT_TYPE
 
@@ -1671,7 +1678,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_common_fallbacks():
     return [
-        MessageHandler(filters.Regex("^(Скасувати|Назад)$"), cancel)
+        MessageHandler(filters.Regex(CANCEL_PATTERN), cancel)
     ]
 
 
@@ -1693,9 +1700,9 @@ def main():
     group_conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Додати групу$"), add_group_start)],
         states={
-            GROUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_name)],
-            GROUP_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_day)],
-            GROUP_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_time)],
+            GROUP_NAME: [MessageHandler(TEXT_INPUT_FILTER, add_group_name)],
+            GROUP_DAY: [MessageHandler(TEXT_INPUT_FILTER, add_group_day)],
+            GROUP_TIME: [MessageHandler(TEXT_INPUT_FILTER, add_group_time)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1703,11 +1710,11 @@ def main():
     student_conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Додати учня$"), add_student_start)],
         states={
-            STUDENT_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_student_type)],
-            STUDENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_student_name)],
-            STUDENT_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_student_day)],
-            STUDENT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_student_time)],
-            STUDENT_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_student_group)],
+            STUDENT_TYPE: [MessageHandler(TEXT_INPUT_FILTER, add_student_type)],
+            STUDENT_NAME: [MessageHandler(TEXT_INPUT_FILTER, add_student_name)],
+            STUDENT_DAY: [MessageHandler(TEXT_INPUT_FILTER, add_student_day)],
+            STUDENT_TIME: [MessageHandler(TEXT_INPUT_FILTER, add_student_time)],
+            STUDENT_GROUP: [MessageHandler(TEXT_INPUT_FILTER, add_student_group)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1718,9 +1725,9 @@ def main():
             MessageHandler(filters.TEXT & filters.Regex("^Швидка оплата$"), add_payment_start),
         ],
         states={
-            PAYMENT_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_payment_student_id)],
-            PAYMENT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_payment_amount)],
-            PAYMENT_LESSONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_payment_lessons)],
+            PAYMENT_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, add_payment_student_id)],
+            PAYMENT_AMOUNT: [MessageHandler(TEXT_INPUT_FILTER, add_payment_amount)],
+            PAYMENT_LESSONS: [MessageHandler(TEXT_INPUT_FILTER, add_payment_lessons)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1731,7 +1738,7 @@ def main():
             MessageHandler(filters.TEXT & filters.Regex("^Швидке індивідуальне списання$"), start_individual_lesson),
         ],
         states={
-            LESSON_INDIVIDUAL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_individual_complete)],
+            LESSON_INDIVIDUAL_ID: [MessageHandler(TEXT_INPUT_FILTER, lesson_individual_complete)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1742,8 +1749,8 @@ def main():
             MessageHandler(filters.TEXT & filters.Regex("^Швидке групове списання$"), start_group_lesson),
         ],
         states={
-            LESSON_GROUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_group_choose)],
-            LESSON_GROUP_PRESENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_group_present)],
+            LESSON_GROUP_ID: [MessageHandler(TEXT_INPUT_FILTER, lesson_group_choose)],
+            LESSON_GROUP_PRESENT: [MessageHandler(TEXT_INPUT_FILTER, lesson_group_present)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1751,7 +1758,7 @@ def main():
     card_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Картка учня$"), show_student_card_start)],
         states={
-            CARD_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, show_student_card_finish)],
+            CARD_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, show_student_card_finish)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1759,7 +1766,7 @@ def main():
     history_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Історія оплат$"), student_history_start)],
         states={
-            HISTORY_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, student_history_finish)],
+            HISTORY_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, student_history_finish)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1767,7 +1774,7 @@ def main():
     deactivate_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Деактивувати учня$"), deactivate_student_start)],
         states={
-            DEACTIVATE_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, deactivate_student_finish)],
+            DEACTIVATE_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, deactivate_student_finish)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1775,8 +1782,8 @@ def main():
     balance_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Змінити баланс$"), update_balance_start)],
         states={
-            BALANCE_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_balance_student)],
-            BALANCE_NEW_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_balance_finish)],
+            BALANCE_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, update_balance_student)],
+            BALANCE_NEW_VALUE: [MessageHandler(TEXT_INPUT_FILTER, update_balance_finish)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1784,8 +1791,8 @@ def main():
     move_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Перевести в групу$"), move_student_start)],
         states={
-            MOVE_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_student_choose_student)],
-            MOVE_GROUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_student_choose_group)],
+            MOVE_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, move_student_choose_student)],
+            MOVE_GROUP_ID: [MessageHandler(TEXT_INPUT_FILTER, move_student_choose_group)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1793,9 +1800,9 @@ def main():
     schedule_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Змінити розклад$"), schedule_start)],
         states={
-            SCHEDULE_STUDENT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_choose_student)],
-            SCHEDULE_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_choose_day)],
-            SCHEDULE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_finish)],
+            SCHEDULE_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, schedule_choose_student)],
+            SCHEDULE_DAY: [MessageHandler(TEXT_INPUT_FILTER, schedule_choose_day)],
+            SCHEDULE_TIME: [MessageHandler(TEXT_INPUT_FILTER, schedule_finish)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1803,7 +1810,7 @@ def main():
     search_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Пошук учня$"), search_student_start)],
         states={
-            SEARCH_NAME_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_student_finish)],
+            SEARCH_NAME_QUERY: [MessageHandler(TEXT_INPUT_FILTER, search_student_finish)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1811,7 +1818,7 @@ def main():
     filter_group_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Учні групи$"), filter_group_start)],
         states={
-            FILTER_GROUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, filter_group_finish)],
+            FILTER_GROUP_ID: [MessageHandler(TEXT_INPUT_FILTER, filter_group_finish)],
         },
         fallbacks=get_common_fallbacks()
     )
@@ -1819,7 +1826,7 @@ def main():
     auto_time_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Змінити час автонагадування$"), auto_time_start)],
         states={
-            AUTO_TIME_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_time_finish)],
+            AUTO_TIME_VALUE: [MessageHandler(TEXT_INPUT_FILTER, auto_time_finish)],
         },
         fallbacks=get_common_fallbacks()
     )
