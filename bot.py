@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -224,7 +225,6 @@ async def auto_reminder_loop(app: Application):
 
 async def post_init(app: Application):
     ensure_default_settings()
-
     await app.bot.delete_webhook(drop_pending_updates=True)
 
     auto_task = asyncio.create_task(auto_reminder_loop(app))
@@ -240,6 +240,16 @@ async def post_shutdown(app: Application):
             await auto_task
         except asyncio.CancelledError:
             pass
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+
+    if isinstance(error, Conflict):
+        logger.warning("Тимчасовий Conflict під час polling. Ймовірно, накладення двох інстансів під час redeploy.")
+        return
+
+    logger.exception("Необроблена помилка в боті", exc_info=error)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1519,6 +1529,7 @@ def main():
         fallbacks=[]
     )
 
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(group_conv_handler)
     app.add_handler(student_conv_handler)
