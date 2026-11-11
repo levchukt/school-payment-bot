@@ -1,1694 +1,1791 @@
+"""NEUTRON · бот обліку оплачених уроків.
+
+Керування — кнопками. Вводити ID не потрібно: учня або групу обираєш
+натисканням, а в будь-який момент можна просто написати частину імені.
+"""
 import asyncio
+import csv
+import html
+import io
 import logging
 import os
-from datetime import datetime
+import re
+import time
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.error import Conflict
-from telegram.ext import (
+
+load_dotenv()
+
+from telegram import (  # noqa: E402
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ParseMode  # noqa: E402
+from telegram.error import BadRequest, Conflict  # noqa: E402
+from telegram.ext import (  # noqa: E402
     Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    ConversationHandler,
+    MessageHandler,
+    TypeHandler,
     filters,
 )
 
-from database.db import init_db
-from database.groups import create_group, get_all_groups, get_group_by_id
-from database.lessons import complete_group_lesson, complete_individual_lesson
-from database.payments import (
-    add_payment,
-    get_debt_students,
-    get_grouped_payment_alerts,
-    get_individual_payment_alerts,
-    get_low_balance_students,
-    get_payments_by_student,
+from database.db import backup_db, init_db, name_key  # noqa: E402
+from database.groups import (  # noqa: E402
+    create_group,
+    get_all_groups,
+    get_archived_groups,
+    get_group_by_id,
+    rename_group,
+    set_group_active,
+    update_group_schedule,
 )
-from database.settings import get_setting, set_setting
-from database.students import (
+from database.lessons import (  # noqa: E402
+    cancel_lesson,
+    complete_group_lesson,
+    complete_individual_lesson,
+    get_group_attendance,
+    get_lesson,
+    get_student_attendance_stats,
+    get_student_lessons,
+    lessons_on_date,
+    set_attendance,
+)
+from database.payments import (  # noqa: E402
+    add_payment,
+    cancel_payment,
+    get_low_balance_students,
+    get_month_report,
+    get_payment,
+    get_payments_by_student,
+    suggest_packages,
+)
+from database.settings import get_setting, set_setting  # noqa: E402
+from database.students import (  # noqa: E402
     create_group_student,
     create_individual_student,
-    deactivate_student,
     get_all_students,
     get_inactive_students,
     get_individual_students,
     get_student_by_id,
     get_students_by_group_id,
+    make_student_individual,
     move_student_to_group,
+    rename_student,
     search_students_by_name,
+    set_student_active,
     update_individual_schedule,
     update_student_balance,
+    update_student_notes,
 )
-
-load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TIMEZONE = ZoneInfo("Europe/Kyiv")
 
+# True — на груповому занятті всі одразу позначені присутніми, знімаєш відсутніх.
+# False — ніхто не позначений, відмічаєш присутніх.
+DEFAULT_ALL_PRESENT = True
+
+# Залишок, з якого учень потрапляє в «Баланси» та автозведення.
+LOW_BALANCE = 1
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-GROUP_NAME, GROUP_DAY, GROUP_TIME = range(3)
-STUDENT_TYPE, STUDENT_NAME, STUDENT_DAY, STUDENT_TIME, STUDENT_GROUP = range(10, 15)
-PAYMENT_STUDENT_ID, PAYMENT_AMOUNT, PAYMENT_LESSONS = range(20, 23)
-LESSON_INDIVIDUAL_ID, LESSON_GROUP_ID, LESSON_GROUP_PRESENT = range(30, 33)
-CARD_STUDENT_ID, HISTORY_STUDENT_ID, DEACTIVATE_STUDENT_ID = range(40, 43)
-BALANCE_STUDENT_ID, BALANCE_NEW_VALUE = range(50, 52)
-MOVE_STUDENT_ID, MOVE_GROUP_ID = range(60, 62)
-SCHEDULE_STUDENT_ID, SCHEDULE_DAY, SCHEDULE_TIME = range(70, 73)
-SEARCH_NAME_QUERY, FILTER_GROUP_ID, AUTO_TIME_VALUE = range(80, 83)
+BACKGROUND_TASK_KEY = "background_task"
 
-AUTO_REMINDER_TASK_KEY = "auto_reminder_task"
-CANCEL_PATTERN = r"^(Скасувати|Назад)$"
-TEXT_INPUT_FILTER = filters.TEXT & ~filters.COMMAND & ~filters.Regex(CANCEL_PATTERN)
+DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+MONTHS = [
+    "січень", "лютий", "березень", "квітень", "травень", "червень",
+    "липень", "серпень", "вересень", "жовтень", "листопад", "грудень",
+]
+DAY_ALIASES = {
+    "понеділок": 0, "пн": 0, "пон": 0, "monday": 0, "mon": 0,
+    "вівторок": 1, "вт": 1, "вів": 1, "tuesday": 1, "tue": 1,
+    "середа": 2, "ср": 2, "сер": 2, "wednesday": 2, "wed": 2,
+    "четвер": 3, "чт": 3, "чет": 3, "thursday": 3, "thu": 3,
+    "п'ятниця": 4, "пятниця": 4, "пт": 4, "friday": 4, "fri": 4,
+    "субота": 5, "сб": 5, "суб": 5, "saturday": 5, "sat": 5,
+    "неділя": 6, "нд": 6, "нед": 6, "sunday": 6, "sun": 6,
+}
+
+MENU = [
+    ["✅ Провести урок", "💳 Оплата"],
+    ["👥 Учні", "🗂 Групи"],
+    ["📊 Відвідуваність", "⚠️ Баланси"],
+    ["📈 Звіт", "⚙️ Налаштування"],
+]
+
+# Кнопки старої версії бота: якщо в Telegram ще висить стара клавіатура,
+# натискання просто відкриє нове меню.
+OLD_BUTTONS = {
+    "Учні", "Групи", "Оплати", "Уроки", "Нагадування", "Швидкі дії", "Пошук і фільтри",
+    "Назад", "Додати групу", "Список груп", "Додати учня", "Список учнів", "Картка учня",
+    "Історія оплат", "Змінити баланс", "Деактивувати учня", "Перевести в групу",
+    "Змінити розклад", "Додати оплату", "Учні з малим залишком", "Індивідуальний урок",
+    "Групове заняття", "Загальне зведення", "Індивідуальні нагадування",
+    "Групові нагадування", "Боржники", "Увімкнути автонагадування",
+    "Вимкнути автонагадування", "Змінити час автонагадування", "Сьогоднішні уроки",
+    "Швидка оплата", "Швидке індивідуальне списання", "Швидке групове списання",
+    "Пошук учня", "Учні групи", "Неактивні учні", "Проблемні баланси",
+}
 
 
-def get_local_now() -> datetime:
+# ───────────────────────── Допоміжні функції ─────────────────────────
+
+def now() -> datetime:
     return datetime.now(TIMEZONE)
 
 
-def ensure_default_settings():
-    if get_setting("auto_reminders_enabled") is None:
-        set_setting("auto_reminders_enabled", "0")
-    if get_setting("auto_reminders_hour") is None:
-        set_setting("auto_reminders_hour", "09")
-    if get_setting("auto_reminders_minute") is None:
-        set_setting("auto_reminders_minute", "00")
-    if get_setting("last_auto_reminder_date") is None:
-        set_setting("last_auto_reminder_date", "")
+def stamp(day: date | None = None) -> str:
+    """Дата-час для запису в базу (київський час)."""
+    current = now()
+    if day is None or day == current.date():
+        return current.strftime("%Y-%m-%d %H:%M:%S")
+    return f"{day.isoformat()} 12:00:00"
 
 
-def get_main_menu_markup() -> ReplyKeyboardMarkup:
-    keyboard = [
-        ["Учні", "Групи"],
-        ["Оплати", "Уроки"],
-        ["Нагадування", "Швидкі дії"],
-        ["Пошук і фільтри"],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+def esc(value) -> str:
+    return html.escape(str(value if value is not None else ""))
 
 
-def get_cancel_markup() -> ReplyKeyboardMarkup:
-    keyboard = [
-        ["Скасувати", "Назад"]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+def btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, callback_data=data)
 
 
-def normalize_weekday(day_text: str) -> int | None:
-    if not day_text:
+def markup(rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([row for row in rows if row])
+
+
+def chunk(items: list, size: int) -> list[list]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def parse_days(text: str | None) -> list[int]:
+    """'Понеділок', 'пн, ср', 'Пн/Чт' → [0], [0, 2], [0, 3]."""
+    if not text:
+        return []
+    cleaned = text.lower().replace("ʼ", "'").replace("’", "'").replace("`", "'")
+    found = []
+    for token in re.split(r"[\s,;/.+]+", cleaned):
+        day = DAY_ALIASES.get(token)
+        if day is not None and day not in found:
+            found.append(day)
+    return sorted(found)
+
+
+def format_days(days) -> str:
+    return ", ".join(DAYS[d] for d in sorted(days))
+
+
+def schedule_text(day_text: str | None, time_text: str | None) -> str:
+    days = parse_days(day_text)
+    day_part = format_days(days) if days else (day_text or "")
+    result = f"{day_part} {time_text or ''}".strip()
+    return result or "розклад не задано"
+
+
+def parse_time(text: str) -> str | None:
+    match = re.fullmatch(r"\s*(\d{1,2})(?:[:.\-\s]?(\d{2}))?\s*", text)
+    if not match:
         return None
-
-    value = day_text.strip().lower()
-
-    mapping = {
-        "понеділок": 0,
-        "пн": 0,
-        "monday": 0,
-        "mon": 0,
-        "вівторок": 1,
-        "вт": 1,
-        "tuesday": 1,
-        "tue": 1,
-        "середа": 2,
-        "ср": 2,
-        "wednesday": 2,
-        "wed": 2,
-        "четвер": 3,
-        "чт": 3,
-        "thursday": 3,
-        "thu": 3,
-        "пʼятниця": 4,
-        "п'ятниця": 4,
-        "пт": 4,
-        "friday": 4,
-        "fri": 4,
-        "субота": 5,
-        "сб": 5,
-        "saturday": 5,
-        "sat": 5,
-        "неділя": 6,
-        "нд": 6,
-        "sunday": 6,
-        "sun": 6,
-    }
-
-    return mapping.get(value)
+    hour, minute = int(match.group(1)), int(match.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
 
 
-def format_student_line(student) -> str:
-    if student["student_type"] == "individual":
-        return (
-            f"{student['id']}. {student['name']} | Індивідуально | "
-            f"{student['lesson_day']} {student['lesson_time']} | "
-            f"Залишок: {student['remaining_lessons']}"
+def time_key(time_text: str | None) -> str:
+    return parse_time(time_text or "") or "99:99"
+
+
+def fmt_day(day: date) -> str:
+    today = now().date()
+    label = f"{day:%d.%m} ({DAYS[day.weekday()]})"
+    if day == today:
+        return f"сьогодні, {label}"
+    if day == today - timedelta(days=1):
+        return f"вчора, {label}"
+    return label
+
+
+def fmt_date(value: str | None, with_year: bool = True) -> str:
+    """'2026-11-11 16:00:00' → '11.11.2026'."""
+    if not value:
+        return "—"
+    try:
+        parsed = datetime.strptime(value[:10], "%Y-%m-%d")
+    except ValueError:
+        return value
+    return parsed.strftime("%d.%m.%Y" if with_year else "%d.%m")
+
+
+def num(amount: float) -> str:
+    """Число для callback_data без втрати точності: 2400.0 → '2400'."""
+    return str(int(amount)) if float(amount).is_integer() else repr(float(amount))
+
+
+def fmt_money(amount: float) -> str:
+    if float(amount).is_integer():
+        return f"{int(amount):,}".replace(",", " ")
+    return f"{amount:,.2f}".replace(",", " ")
+
+
+def month_title(month: str) -> str:
+    year, number = month.split("-")
+    return f"{MONTHS[int(number) - 1]} {year}"
+
+
+def shift_month(month: str, delta: int) -> str:
+    year, number = map(int, month.split("-"))
+    index = year * 12 + (number - 1) + delta
+    return f"{index // 12:04d}-{index % 12 + 1:02d}"
+
+
+def current_month() -> str:
+    return now().strftime("%Y-%m")
+
+
+def bal_icon(balance: int) -> str:
+    if balance < 0:
+        return "🔴"
+    if balance == 0:
+        return "🟠"
+    if balance <= LOW_BALANCE:
+        return "🟡"
+    return "🟢"
+
+
+def bal_text(balance: int) -> str:
+    if balance < 0:
+        return f"борг {abs(balance)}"
+    if balance == 0:
+        return "уроки закінчились"
+    return f"залишок {balance}"
+
+
+def student_button(student, target: str) -> InlineKeyboardButton:
+    balance = student["remaining_lessons"]
+    return btn(f"{bal_icon(balance)} {student['name']} · {balance}", f"{target}:{student['id']}")
+
+
+def student_place(student) -> str:
+    if student["student_type"] == "group":
+        return student["group_name"] or "без групи"
+    return "індивідуально"
+
+
+async def show(update: Update, text: str, rows=None) -> None:
+    """Оновлює повідомлення з кнопками або надсилає нове."""
+    reply_markup = markup(rows) if rows else None
+    query = update.callback_query
+
+    if query:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+            return
+        except BadRequest as error:
+            if "not modified" in str(error).lower():
+                return
+            logger.info("Не вдалося відредагувати повідомлення (%s), надсилаю нове", error)
+
+    await update.effective_chat.send_message(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+
+
+async def alert(update: Update, text: str) -> None:
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+    else:
+        await update.effective_chat.send_message(text)
+
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(MENU, resize_keyboard=True)
+
+
+# ───────────────────────── Доступ ─────────────────────────
+
+def admin_ids() -> set[int]:
+    env_ids = {int(x) for x in re.findall(r"-?\d+", os.getenv("ADMIN_IDS", ""))}
+    if env_ids:
+        return env_ids
+    owner = get_setting("admin_chat_id", "")
+    return {int(owner)} if owner else set()
+
+
+def report_chat_id() -> int | None:
+    owner = get_setting("admin_chat_id", "")
+    if owner:
+        return int(owner)
+    ids = admin_ids()
+    return next(iter(ids)) if ids else None
+
+
+async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Бот приватний: працює лише для власника (або ID з ADMIN_IDS)."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        raise ApplicationHandlerStop
+
+    allowed = admin_ids()
+    if not allowed:
+        set_setting("admin_chat_id", str(chat.id))
+        logger.info("Власником бота призначено %s", chat.id)
+        return
+
+    if user.id in allowed or chat.id in allowed:
+        return
+
+    logger.warning("Відмовлено в доступі: user_id=%s (%s)", user.id, user.full_name)
+    if update.callback_query:
+        await update.callback_query.answer("Це приватний бот.", show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text(
+            "⛔ Це приватний бот.\n"
+            f"Твій Telegram ID: {user.id}\n"
+            "Якщо ти власник — додай змінну середовища ADMIN_IDS з цим ID і перезапусти бота."
         )
+    raise ApplicationHandlerStop
 
-    return (
-        f"{student['id']}. {student['name']} | Група: {student['group_name']} | "
-        f"{student['group_lesson_day']} {student['group_lesson_time']} | "
-        f"Залишок: {student['remaining_lessons']}"
+
+# ───────────────────────── Головне меню ─────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    if not get_setting("admin_chat_id", ""):
+        set_setting("admin_chat_id", str(update.effective_chat.id))
+
+    await update.effective_chat.send_message(
+        "<b>NEUTRON · облік уроків</b>\n\n"
+        "Обери розділ кнопками нижче.\n"
+        "Щоб швидко знайти учня — просто напиши частину імені.",
+        reply_markup=main_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
 
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    await update.effective_chat.send_message("Скасовано.", reply_markup=main_keyboard())
+
+
+# ───────────────────────── Уроки ─────────────────────────
+
+async def lesson_hub(update: Update, context: ContextTypes.DEFAULT_TYPE, scope: str = "") -> None:
+    context.user_data.pop("lesson", None)
+    today = now().date()
+    weekday = today.weekday()
+    done_groups, done_students = lessons_on_date(today.isoformat())
+
+    groups = [g for g in get_all_groups() if g["students_count"] > 0]
+    individuals = get_individual_students()
+
+    if not groups and not individuals:
+        await show(update, "Поки немає ні груп з учнями, ні індивідуальних учнів. Додай їх у розділі «Учні».")
+        return
+
+    today_groups = [g for g in groups if weekday in parse_days(g["lesson_day"])]
+    today_individuals = [s for s in individuals if weekday in parse_days(s["lesson_day"])]
+    has_today = bool(today_groups or today_individuals)
+    show_all = scope == "all" or not has_today
+
+    if show_all:
+        list_groups, list_individuals = groups, individuals
+    else:
+        list_groups = sorted(today_groups, key=lambda g: time_key(g["lesson_time"]))
+        list_individuals = sorted(today_individuals, key=lambda s: time_key(s["lesson_time"]))
+
+    rows = []
+    for group in list_groups:
+        mark = "✔️" if group["id"] in done_groups else "👥"
+        label = f"{mark} {group['name']}"
+        if group["lesson_time"]:
+            label += f" · {group['lesson_time']}"
+        label += f" · {group['students_count']} уч."
+        rows.append([btn(label, f"gl:{group['id']}")])
+
+    for student in list_individuals:
+        mark = "✔️" if student["id"] in done_students else "👤"
+        label = f"{mark} {student['name']}"
+        if student["lesson_time"] and not show_all:
+            label += f" · {student['lesson_time']}"
+        label += f" · {student['remaining_lessons']}"
+        rows.append([btn(label, f"il:{student['id']}")])
+
+    if not show_all:
+        rows.append([btn("Інші групи та учні", "L:all")])
+    elif has_today:
+        rows.append([btn("◀ Лише сьогоднішні", "L")])
+
+    header = f"<b>Провести урок</b> · {DAYS[weekday]}, {today:%d.%m}\n"
+    if show_all and not has_today:
+        header += "Сьогодні за розкладом нічого немає — показую всіх.\n"
+    elif show_all:
+        header += "Усі групи та індивідуальні учні.\n"
+    else:
+        header += "Сьогодні за розкладом:\n"
+    header += "\n👥 група — відкриє відмітку присутніх\n👤 учень — одразу спише 1 урок\n✔️ — сьогодні вже проведено"
+
+    await show(update, header, rows)
+
+
+async def group_lesson_start(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> None:
+    students = get_students_by_group_id(int(group_id))
+    if not students:
+        await alert(update, "У цій групі поки немає учнів.")
+        return
+
+    context.user_data["lesson"] = {
+        "gid": int(group_id),
+        "date": now().date().isoformat(),
+        "present": {s["id"] for s in students} if DEFAULT_ALL_PRESENT else set(),
+    }
+    await group_lesson_render(update, context)
+
+
+async def group_lesson_render(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    draft = context.user_data.get("lesson")
+    if not draft:
+        await show(
+            update,
+            "Ця відмітка вже неактуальна (заняття збережено або бот перезапускався).",
+            [[btn("✅ Провести урок", "L")]],
+        )
+        return
+
+    group = get_group_by_id(draft["gid"])
+    students = get_students_by_group_id(draft["gid"])
+    ids = {s["id"] for s in students}
+    draft["present"] &= ids
+    day = date.fromisoformat(draft["date"])
+
+    text = (
+        f"<b>{esc(group['name'])}</b> · групове заняття\n"
+        f"📅 {fmt_day(day)}\n"
+        f"Присутні: <b>{len(draft['present'])}</b> з {len(students)}\n\n"
+        f"Тисни на учня, щоб змінити відмітку.\n"
+        f"Урок спишеться з усіх {len(students)} учнів — і з присутніх, і з відсутніх."
+    )
+
+    buttons = [
+        btn(
+            f"{'✅' if s['id'] in draft['present'] else '❌'} {s['name']} · {s['remaining_lessons']}",
+            f"gt:{s['id']}",
+        )
+        for s in students
+    ]
+    rows = chunk(buttons, 1 if len(buttons) <= 10 else 2)
+    rows.append([btn("✅ Усі", "ga:1"), btn("❌ Нікого", "ga:0")])
+    rows.append([btn("📅 Інша дата", "gd")])
+    rows.append([btn("💾 Провести заняття", "gs:0")])
+    rows.append([btn("✖ Скасувати", "L")])
+
+    await show(update, text, rows)
+
+
+async def group_lesson_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    draft = context.user_data.get("lesson")
+    if draft:
+        draft["present"] ^= {int(student_id)}
+    await group_lesson_render(update, context)
+
+
+async def group_lesson_all(update: Update, context: ContextTypes.DEFAULT_TYPE, flag: str) -> None:
+    draft = context.user_data.get("lesson")
+    if draft:
+        students = get_students_by_group_id(draft["gid"])
+        draft["present"] = {s["id"] for s in students} if flag == "1" else set()
+    await group_lesson_render(update, context)
+
+
+async def group_lesson_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get("lesson"):
+        await group_lesson_render(update, context)
+        return
+
+    today = now().date()
+    buttons = []
+    for offset in range(0, 10):
+        day = today - timedelta(days=offset)
+        label = "Сьогодні" if offset == 0 else "Вчора" if offset == 1 else f"{day:%d.%m} {DAYS[day.weekday()]}"
+        buttons.append(btn(label, f"gD:{day.isoformat()}"))
+
+    rows = chunk(buttons, 2)
+    rows.append([btn("◀ Назад", "gb")])
+    await show(update, "За яку дату провести заняття?", rows)
+
+
+async def group_lesson_set_date(update: Update, context: ContextTypes.DEFAULT_TYPE, day: str) -> None:
+    draft = context.user_data.get("lesson")
+    if draft:
+        draft["date"] = day
+    await group_lesson_render(update, context)
+
+
+def payment_alert_lines(rows) -> list[str]:
+    """rows: [{name, balance}] → рядки про учнів, яким час платити."""
+    lines = []
+    for row in sorted(rows, key=lambda r: r["balance"]):
+        if row["balance"] <= LOW_BALANCE:
+            lines.append(f"{bal_icon(row['balance'])} {esc(row['name'])} — {bal_text(row['balance'])}")
+    return lines
+
+
+async def group_lesson_save(update: Update, context: ContextTypes.DEFAULT_TYPE, force: str = "0") -> None:
+    draft = context.user_data.get("lesson")
+    if not draft:
+        await group_lesson_render(update, context)
+        return
+
+    day = date.fromisoformat(draft["date"])
+    done_groups, _ = lessons_on_date(draft["date"])
+
+    if draft["gid"] in done_groups and force != "1":
+        await show(
+            update,
+            f"⚠️ У цієї групи вже є проведене заняття за {fmt_day(day)}.\n"
+            "Провести ще одне і списати урок вдруге?",
+            [[btn("Так, провести ще одне", "gs:1")], [btn("◀ Назад", "gb")]],
+        )
+        return
+
+    context.user_data.pop("lesson", None)
+    result = complete_group_lesson(draft["gid"], draft["present"], stamp(day))
+
+    if not result["success"]:
+        await show(update, esc(result["message"]))
+        return
+
+    students = result["students"]
+    absent = [s["name"] for s in students if not s["present"]]
+    present_count = len(students) - len(absent)
+
+    text = (
+        f"✅ <b>Заняття проведено</b>\n"
+        f"{esc(result['group_name'])} · {fmt_day(day)}\n\n"
+        f"Присутні: <b>{present_count}</b> з {len(students)}\n"
+    )
+    if absent:
+        text += "Відсутні: " + ", ".join(esc(name) for name in absent) + "\n"
+    text += f"Списано по 1 уроку з усіх {len(students)} учнів.\n"
+
+    alerts = payment_alert_lines(students)
+    if alerts:
+        text += "\n<b>Час нагадати про оплату:</b>\n" + "\n".join(alerts)
+
+    lesson_id = result["lesson_id"]
+    await show(update, text, [
+        [btn("✏️ Виправити відмітки", f"le:{lesson_id}")],
+        [btn("↩️ Скасувати заняття", f"ul:{lesson_id}")],
+    ])
+
+
+async def individual_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str, force: str = "0") -> None:
+    sid = int(student_id)
+    student = get_student_by_id(sid)
+    if not student:
+        await alert(update, "Учня не знайдено.")
+        return
+
+    _, done_students = lessons_on_date(now().date().isoformat())
+    if sid in done_students and force != "1":
+        await show(
+            update,
+            f"⚠️ {esc(student['name'])}: сьогодні урок уже списано.\nСписати ще один?",
+            [[btn("Так, списати ще один", f"il:{sid}:1")], [btn("◀ Назад", "L")]],
+        )
+        return
+
+    result = complete_individual_lesson(sid, stamp())
+    if not result["success"]:
+        await show(update, esc(result["message"]))
+        return
+
+    balance = result["remaining_lessons"]
+    text = (
+        f"✅ <b>Урок проведено</b>\n"
+        f"{esc(result['student_name'])} · {fmt_day(now().date())}\n\n"
+        f"{bal_icon(balance)} {bal_text(balance).capitalize()}"
+    )
+    if balance <= LOW_BALANCE:
+        text += "\nЧас нагадати про оплату."
+
+    await show(update, text, [
+        [btn("↩️ Скасувати урок", f"ul:{result['lesson_id']}"), btn("👤 Картка", f"sc:{sid}")],
+        [btn("✅ До списку уроків", "L")],
+    ])
+
+
+async def lesson_view(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson_id: str) -> None:
+    lesson, rows = get_lesson(int(lesson_id))
+    if not lesson:
+        await alert(update, "Заняття не знайдено.")
+        return
+
+    day_label = fmt_date(lesson["lesson_date"])
+    month = lesson["lesson_date"][:7]
+
+    if lesson["lesson_type"] == "individual":
+        text = f"<b>{esc(lesson['student_name'])}</b> · індивідуальний урок\n📅 {day_label}"
+        back = [btn("👤 Картка", f"sc:{lesson['student_id']}")]
+    else:
+        text = f"<b>{esc(lesson['group_name'])}</b> · групове заняття\n📅 {day_label}"
+        back = [btn("📊 До відвідуваності", f"av:{lesson['group_id']}:{month}")]
+
+    if lesson["status"] != "completed":
+        await show(update, text + "\n\n↩️ Заняття скасовано, уроки повернуто на баланс.", [back])
+        return
+
+    keyboard = []
+    if lesson["lesson_type"] == "group":
+        present = sum(1 for r in rows if r["attendance_status"] == "present")
+        text += f"\nПрисутні: <b>{present}</b> з {len(rows)}\n\nТисни на учня, щоб виправити відмітку. Баланс при цьому не змінюється."
+        buttons = [
+            btn(
+                f"{'✅' if r['attendance_status'] == 'present' else '❌'} {r['name']}",
+                f"lt:{lesson['id']}:{r['student_id']}",
+            )
+            for r in rows
+        ]
+        keyboard = chunk(buttons, 1 if len(buttons) <= 10 else 2)
+
+    keyboard.append([btn("↩️ Скасувати заняття", f"ul:{lesson['id']}")])
+    keyboard.append(back)
+    await show(update, text, keyboard)
+
+
+async def lesson_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson_id: str, student_id: str) -> None:
+    _, rows = get_lesson(int(lesson_id))
+    current = next((r for r in rows if r["student_id"] == int(student_id)), None)
+    if current:
+        set_attendance(int(lesson_id), int(student_id), current["attendance_status"] != "present")
+    await lesson_view(update, context, lesson_id)
+
+
+async def lesson_cancel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson_id: str) -> None:
+    lesson, rows = get_lesson(int(lesson_id))
+    if not lesson or lesson["status"] != "completed":
+        await alert(update, "Це заняття вже скасовано.")
+        return
+
+    title = lesson["group_name"] or lesson["student_name"]
+    refund = sum(1 for r in rows if r["lesson_written_off"])
+    await show(
+        update,
+        f"Скасувати заняття «{esc(title)}» за {fmt_date(lesson['lesson_date'])}?\n"
+        f"Урок повернеться на баланс: {refund} уч.",
+        [[btn("Так, скасувати", f"uL:{lesson_id}")], [btn("Ні, залишити", f"le:{lesson_id}")]],
+    )
+
+
+async def lesson_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE, lesson_id: str) -> None:
+    refunded = cancel_lesson(int(lesson_id))
+    if refunded is None:
+        await alert(update, "Це заняття вже скасовано.")
+        return
+    await show(
+        update,
+        f"↩️ Заняття скасовано. Повернуто уроків на баланс: {refunded}.",
+        [[btn("✅ Провести урок", "L")]],
+    )
+
+
+# ───────────────────────── Вибір учня ─────────────────────────
+
+PICK_TARGET = {"pay": "ps", "card": "sc"}
+PICK_TITLE = {"pay": "💳 <b>Оплата</b> — обери учня", "card": "👥 <b>Учні</b>"}
+
+
+async def picker(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str = "card", scope: str = "") -> None:
+    target = PICK_TARGET[action]
+    students = get_all_students()
+    rows = []
+    text = PICK_TITLE[action]
+    context.user_data["await"] = {"kind": "search", "action": action}
+
+    if scope == "x":
+        inactive = get_inactive_students()
+        text = "🗃 <b>Неактивні учні</b>" if inactive else "Неактивних учнів немає."
+        rows = chunk([student_button(s, "sc") for s in inactive], 1 if len(inactive) <= 10 else 2)
+        rows.append([btn("◀ Назад", f"pk:{action}")])
+    elif not scope and len(students) > 10:
+        groups = get_all_groups()
+        for group in groups:
+            if group["students_count"]:
+                rows.append([btn(f"👥 {group['name']} ({group['students_count']})", f"pk:{action}:g{group['id']}")])
+        individual_count = sum(1 for s in students if s["student_type"] == "individual")
+        if individual_count:
+            rows.append([btn(f"👤 Індивідуальні ({individual_count})", f"pk:{action}:i")])
+        orphans = [s for s in students if s["student_type"] == "group" and not s["group_name"]]
+        rows += [[student_button(s, target)] for s in orphans]
+        text += "\nОбери групу або просто напиши частину імені."
+    else:
+        if scope.startswith("g"):
+            students = [s for s in students if s["group_id"] == int(scope[1:])]
+        elif scope == "i":
+            students = [s for s in students if s["student_type"] == "individual"]
+        if not students:
+            text += "\nУчнів поки немає."
+        buttons = [student_button(s, target) for s in students]
+        rows = chunk(buttons, 1 if len(buttons) <= 10 else 2)
+        if scope:
+            rows.append([btn("◀ Назад", f"pk:{action}")])
+        else:
+            text += "\nЦифра біля імені — залишок уроків."
+
+    if action == "card" and scope != "x":
+        rows.append([btn("➕ Додати учня", "as"), btn("🗃 Неактивні", "pk:card:x")])
+
+    await show(update, text, rows)
+
+
+async def search_students(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str, action: str = "card") -> None:
+    found = search_students_by_name(query_text)
+    if not found:
+        await update.effective_chat.send_message(
+            f"За запитом «{query_text}» учнів не знайдено.\n"
+            "Розділи бота — на клавіатурі нижче.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    target = PICK_TARGET.get(action, "sc")
+    if len(found) == 1:
+        await ROUTES[target](update, context, str(found[0]["id"]))
+        return
+
+    buttons = []
+    for student in found[:30]:
+        label = f"{bal_icon(student['remaining_lessons'])} {student['name']} · {student_place(student)}"
+        if not student["is_active"]:
+            label = f"🗃 {student['name']} · неактивний"
+        buttons.append([btn(label, f"{target}:{student['id']}")])
+    await show(update, f"Знайдено за «{esc(query_text)}»:", buttons)
+
+
+# ───────────────────────── Оплати ─────────────────────────
+
+async def payment_packages(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    student = get_student_by_id(int(student_id))
+    if not student:
+        await alert(update, "Учня не знайдено.")
+        return
+
+    balance = student["remaining_lessons"]
+    rows = [
+        [btn(f"{lessons} ур. · {fmt_money(amount)} грн", f"pa:{student['id']}:{lessons}:{num(amount)}")]
+        for lessons, amount in suggest_packages(student["id"])
+    ]
+    rows.append([btn("✍️ Ввести вручну", f"pm:{student['id']}")])
+    rows.append([btn("👤 Картка", f"sc:{student['id']}")])
+
+    text = (
+        f"💳 <b>Оплата · {esc(student['name'])}</b>\n"
+        f"{esc(student_place(student))} · {bal_icon(balance)} {bal_text(balance)}\n\n"
+    )
+    text += "Обери пакет або введи вручну." if len(rows) > 2 else "Натисни «Ввести вручну»."
+    await show(update, text, rows)
+
+
+async def payment_manual(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    context.user_data["await"] = {"kind": "pay", "sid": int(student_id)}
+    await show(
+        update,
+        "Введи кількість уроків і суму через пробіл.\nНаприклад: <code>8 2400</code>",
+        [[btn("✖ Скасувати", f"ps:{student_id}")]],
+    )
+
+
+async def payment_save(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str, lessons: str, amount: str) -> None:
+    sid, lessons_paid, value = int(student_id), int(lessons), float(amount)
+
+    # Захист від подвійного натискання.
+    fingerprint = (sid, lessons_paid, value)
+    last = context.user_data.get("last_payment")
+    if last and last[0] == fingerprint and time.monotonic() - last[1] < 5:
+        return
+    context.user_data["last_payment"] = (fingerprint, time.monotonic())
+
+    student = get_student_by_id(sid)
+    result = add_payment(sid, value, lessons_paid, stamp())
+    if not student or not result:
+        await alert(update, "Учня не знайдено.")
+        return
+
+    balance = result["balance"]
+    await show(
+        update,
+        f"💳 <b>Оплату додано</b>\n"
+        f"{esc(student['name'])}\n\n"
+        f"+{lessons_paid} ур. · {fmt_money(value)} грн\n"
+        f"{bal_icon(balance)} {bal_text(balance).capitalize()}",
+        [
+            [btn("↩️ Скасувати оплату", f"up:{result['payment_id']}"), btn("👤 Картка", f"sc:{sid}")],
+            [btn("💳 Ще одна оплата", "P")],
+        ],
+    )
+
+
+async def payment_cancel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, payment_id: str) -> None:
+    payment = get_payment(int(payment_id))
+    if not payment or payment["is_cancelled"]:
+        await alert(update, "Цю оплату вже скасовано.")
+        return
+    await show(
+        update,
+        f"Скасувати оплату?\n{esc(payment['student_name'])} · {fmt_date(payment['payment_date'])} · "
+        f"{payment['lessons_paid']} ур. · {fmt_money(payment['amount'])} грн\n"
+        "Ці уроки знімуться з балансу.",
+        [[btn("Так, скасувати", f"uP:{payment_id}")], [btn("Ні, залишити", f"sc:{payment['student_id']}")]],
+    )
+
+
+async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE, payment_id: str) -> None:
+    result = cancel_payment(int(payment_id))
+    if not result:
+        await alert(update, "Цю оплату вже скасовано.")
+        return
+    await show(
+        update,
+        f"↩️ Оплату скасовано.\n{esc(result['student_name'])}: {bal_text(result['balance'])}.",
+    )
+
+
+# ───────────────────────── Картка учня ─────────────────────────
+
+async def student_card(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    student = get_student_by_id(int(student_id))
+    if not student:
+        await alert(update, "Учня не знайдено.")
+        return
+
+    sid = student["id"]
+    balance = student["remaining_lessons"]
+    stats = get_student_attendance_stats(sid)
+
+    text = f"<b>{esc(student['name'])}</b>"
+    if not student["is_active"]:
+        text += " · 🗃 неактивний"
+    text += "\n"
+
+    if student["student_type"] == "group":
+        schedule = schedule_text(student["group_lesson_day"], student["group_lesson_time"])
+        text += f"Група: {esc(student['group_name'] or '—')} ({esc(schedule)})\n"
+    else:
+        text += f"Індивідуально · {esc(schedule_text(student['lesson_day'], student['lesson_time']))}\n"
+
+    text += f"\n{bal_icon(balance)} <b>{bal_text(balance).capitalize()}</b>\n"
+    text += f"Остання оплата: {fmt_date(student['last_payment_date'])}\n"
+    if stats["total"]:
+        percent = round(100 * stats["present"] / stats["total"])
+        text += f"Відвідуваність: {stats['present']} з {stats['total']} ({percent}%)\n"
+    if student["notes"]:
+        text += f"📝 {esc(student['notes'])}\n"
+
+    rows = []
+    first = [btn("💳 Оплата", f"ps:{sid}")]
+    if student["student_type"] == "individual" and student["is_active"]:
+        first.append(btn("✅ Списати урок", f"il:{sid}"))
+    rows.append(first)
+    rows.append([btn("🧾 Історія", f"sh:{sid}"), btn("✏️ Баланс", f"sb:{sid}")])
+
+    third = [btn("🔁 Перевести", f"sm:{sid}")]
+    if student["student_type"] == "individual":
+        third.insert(0, btn("📅 Розклад", f"ss:{sid}"))
+    rows.append(third)
+    rows.append([btn("✏️ Ім'я", f"sn:{sid}"), btn("📝 Нотатка", f"so:{sid}")])
+
+    if student["is_active"]:
+        rows.append([btn("🚫 Деактивувати", f"sd:{sid}")])
+    else:
+        rows.append([btn("♻️ Повернути в активні", f"sa:{sid}")])
+    rows.append([btn("◀ До списку учнів", "pk:card")])
+
+    await show(update, text, rows)
+
+
+async def student_history(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    student = get_student_by_id(int(student_id))
+    if not student:
+        await alert(update, "Учня не знайдено.")
+        return
+
+    payments = get_payments_by_student(student["id"], limit=10)
+    lessons = get_student_lessons(student["id"], limit=20)
+
+    text = f"🧾 <b>Історія · {esc(student['name'])}</b>\n\n<b>Оплати</b>\n"
+    if payments:
+        for payment in payments:
+            text += f"{fmt_date(payment['payment_date'])} · {payment['lessons_paid']} ур. · {fmt_money(payment['amount'])} грн\n"
+    else:
+        text += "оплат ще не було\n"
+
+    text += "\n<b>Уроки</b> (останні)\n"
+    if lessons:
+        for lesson in lessons:
+            mark = "✅" if lesson["attendance_status"] == "present" else "❌"
+            note = "" if lesson["lesson_written_off"] else " · не списано"
+            text += f"{mark} {fmt_date(lesson['lesson_date'])}{note}\n"
+    else:
+        text += "уроків ще не було\n"
+
+    rows = []
+    if payments:
+        last = payments[0]
+        rows.append([btn(f"↩️ Скасувати оплату {fmt_date(last['payment_date'], False)}", f"up:{last['id']}")])
+    rows.append([btn("◀ Картка", f"sc:{student['id']}")])
+    await show(update, text, rows)
+
+
+async def ask_text(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict, prompt: str, back: str) -> None:
+    context.user_data["await"] = state
+    await show(update, prompt, [[btn("✖ Скасувати", back)]])
+
+
+async def student_balance_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    student = get_student_by_id(int(student_id))
+    await ask_text(
+        update, context, {"kind": "balance", "sid": int(student_id)},
+        f"<b>{esc(student['name'])}</b> · зараз на балансі: {student['remaining_lessons']}\n\n"
+        "Введи:\n"
+        "<code>+2</code> або <code>-1</code> — додати / зняти уроки\n"
+        "<code>5</code> — встановити рівно 5\n"
+        "<code>=-2</code> — встановити борг 2",
+        f"sc:{student_id}",
+    )
+
+
+async def student_rename_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    await ask_text(update, context, {"kind": "rename_s", "sid": int(student_id)}, "Введи нове ім'я учня:", f"sc:{student_id}")
+
+
+async def student_note_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    await ask_text(
+        update, context, {"kind": "note_s", "sid": int(student_id)},
+        "Введи нотатку (телефон батьків, домовленості тощо).\nЩоб очистити — надішли <code>-</code>",
+        f"sc:{student_id}",
+    )
+
+
+async def student_deactivate_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    student = get_student_by_id(int(student_id))
+    await show(
+        update,
+        f"Деактивувати учня <b>{esc(student['name'])}</b>?\n"
+        "Він зникне зі списків і групових занять. Історія та баланс збережуться, повернути можна будь-коли.",
+        [[btn("Так, деактивувати", f"sD:{student_id}")], [btn("Ні", f"sc:{student_id}")]],
+    )
+
+
+async def student_deactivate(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    set_student_active(int(student_id), False)
+    await student_card(update, context, student_id)
+
+
+async def student_activate(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    set_student_active(int(student_id), True)
+    await student_card(update, context, student_id)
+
+
+async def student_move_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    student = get_student_by_id(int(student_id))
+    rows = [
+        [btn(f"👥 {group['name']}", f"sM:{student_id}:{group['id']}")]
+        for group in get_all_groups()
+        if group["id"] != student["group_id"]
+    ]
+    if student["student_type"] == "group":
+        rows.append([btn("👤 Зробити індивідуальним", f"sM:{student_id}:0")])
+    rows.append([btn("◀ Картка", f"sc:{student_id}")])
+    await show(update, f"Куди перевести <b>{esc(student['name'])}</b>?\nБаланс уроків збережеться.", rows)
+
+
+async def student_move(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str, group_id: str) -> None:
+    if group_id == "0":
+        make_student_individual(int(student_id))
+    else:
+        move_student_to_group(int(student_id), int(group_id))
+    await student_card(update, context, student_id)
+
+
+async def add_student_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = [[btn(f"👥 {group['name']}", f"an:g{group['id']}")] for group in get_all_groups()]
+    rows.append([btn("👤 Індивідуальний учень", "an:i")])
+    rows.append([btn("◀ Назад", "pk:card")])
+    await show(update, "➕ <b>Новий учень</b>\nКуди додати?", rows)
+
+
+async def add_student_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, scope: str) -> None:
+    group_id = int(scope[1:]) if scope.startswith("g") else None
+    place = "індивідуальні"
+    if group_id:
+        place = f"група «{esc(get_group_by_id(group_id)['name'])}»"
+    await ask_text(
+        update, context, {"kind": "add_students", "gid": group_id},
+        f"➕ Новий учень · {place}\n\nВведи ім'я та прізвище.\n"
+        "Можна додати кількох одразу — кожного з нового рядка.",
+        f"gc:{group_id}" if group_id else "pk:card",
+    )
+
+
+# ───────────────────────── Розклад (учень або група) ─────────────────────────
+
+async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str, item_id: str) -> None:
+    if kind == "s":
+        item = get_student_by_id(int(item_id))
+    else:
+        item = get_group_by_id(int(item_id))
+    context.user_data["sched"] = {
+        "kind": kind,
+        "id": int(item_id),
+        "name": item["name"],
+        "days": set(parse_days(item["lesson_day"])),
+        "time": parse_time(item["lesson_time"] or ""),
+    }
+    await schedule_render(update, context)
+
+
+async def schedule_student(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str) -> None:
+    await schedule_start(update, context, "s", student_id)
+
+
+async def schedule_group(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> None:
+    await schedule_start(update, context, "g", group_id)
+
+
+def schedule_back(draft: dict) -> str:
+    return f"{'sc' if draft['kind'] == 's' else 'gc'}:{draft['id']}"
+
+
+async def schedule_render(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    draft = context.user_data.get("sched")
+    if not draft:
+        await show(update, "Редагування розкладу вже неактуальне. Відкрий картку ще раз.")
+        return
+
+    buttons = [
+        btn(f"{'✅' if index in draft['days'] else '▫️'} {name}", f"dy:{index}")
+        for index, name in enumerate(DAYS)
+    ]
+    rows = [buttons[:4], buttons[4:]]
+    rows.append([btn("Далі → час", "dY")])
+    rows.append([btn("✖ Скасувати", schedule_back(draft))])
+    await show(update, f"📅 <b>Розклад · {esc(draft['name'])}</b>\nПознач дні занять:", rows)
+
+
+async def schedule_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, day: str) -> None:
+    draft = context.user_data.get("sched")
+    if draft:
+        draft["days"] ^= {int(day)}
+    await schedule_render(update, context)
+
+
+async def schedule_time_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    draft = context.user_data.get("sched")
+    if not draft:
+        await schedule_render(update, context)
+        return
+
+    context.user_data["await"] = {"kind": "sched_time"}
+    rows = []
+    if draft["time"]:
+        rows.append([btn(f"Залишити {draft['time']}", "dK")])
+    rows.append([btn("✖ Скасувати", schedule_back(draft))])
+    await show(
+        update,
+        f"Дні: {format_days(draft['days']) or 'не обрано'}\nВведи час занять, наприклад <code>16:00</code>",
+        rows,
+    )
+
+
+async def schedule_save(update: Update, context: ContextTypes.DEFAULT_TYPE, time_text: str | None = None) -> None:
+    draft = context.user_data.pop("sched", None)
+    if not draft:
+        await schedule_render(update, context)
+        return
+
+    days = format_days(draft["days"])
+    lesson_time = time_text or draft["time"] or ""
+    if draft["kind"] == "s":
+        update_individual_schedule(draft["id"], days, lesson_time)
+        await student_card(update, context, str(draft["id"]))
+    else:
+        update_group_schedule(draft["id"], days, lesson_time)
+        await group_card(update, context, str(draft["id"]))
+
+
+# ───────────────────────── Групи ─────────────────────────
+
+async def groups_list(update: Update, context: ContextTypes.DEFAULT_TYPE, scope: str = "") -> None:
+    if scope == "x":
+        archived = get_archived_groups()
+        rows = [[btn(f"♻️ {group['name']}", f"gr:{group['id']}")] for group in archived]
+        rows.append([btn("◀ Назад", "G")])
+        await show(update, "🗃 <b>Архів груп</b>\nНатисни на групу, щоб повернути її." if archived else "Архів порожній.", rows)
+        return
+
+    groups = get_all_groups()
+    rows = [
+        [btn(
+            f"👥 {group['name']} · {schedule_text(group['lesson_day'], group['lesson_time'])} · {group['students_count']} уч.",
+            f"gc:{group['id']}",
+        )]
+        for group in groups
+    ]
+    last = [btn("➕ Нова група", "ag")]
+    if get_archived_groups():
+        last.append(btn("🗃 Архів", "G:x"))
+    rows.append(last)
+    await show(update, "🗂 <b>Групи</b>" if groups else "Груп поки немає.", rows)
+
+
+async def group_card(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> None:
+    group = get_group_by_id(int(group_id))
+    if not group:
+        await alert(update, "Групу не знайдено.")
+        return
+
+    students = get_students_by_group_id(group["id"])
+    text = (
+        f"<b>{esc(group['name'])}</b>\n"
+        f"📅 {esc(schedule_text(group['lesson_day'], group['lesson_time']))}\n"
+        f"Учнів: {len(students)}\n\n"
+    )
+    for student in students:
+        balance = student["remaining_lessons"]
+        text += f"{bal_icon(balance)} {esc(student['name'])} — {balance}\n"
+    if not students:
+        text += "У групі поки немає учнів.\n"
+
+    gid = group["id"]
+    rows = [
+        [btn("✅ Провести заняття", f"gl:{gid}")],
+        [btn("📊 Відвідуваність", f"av:{gid}"), btn("➕ Додати учнів", f"an:g{gid}")],
+        [btn("📅 Розклад", f"gy:{gid}"), btn("✏️ Назва", f"gn:{gid}")],
+        [btn("🗃 В архів", f"gx:{gid}")],
+        [btn("◀ До груп", "G")],
+    ]
+    await show(update, text, rows)
+
+
+async def group_add_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await ask_text(update, context, {"kind": "add_group"}, "➕ <b>Нова група</b>\nВведи назву групи:", "G")
+
+
+async def group_rename_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> None:
+    await ask_text(update, context, {"kind": "rename_g", "gid": int(group_id)}, "Введи нову назву групи:", f"gc:{group_id}")
+
+
+async def group_archive_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> None:
+    group = get_group_by_id(int(group_id))
+    await show(
+        update,
+        f"Перенести групу <b>{esc(group['name'])}</b> в архів?\n"
+        "Вона зникне зі списків, уся історія збережеться. Учні залишаться активними — переведи або деактивуй їх за потреби.",
+        [[btn("Так, в архів", f"gX:{group_id}")], [btn("Ні", f"gc:{group_id}")]],
+    )
+
+
+async def group_archive(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> None:
+    set_group_active(int(group_id), False)
+    await groups_list(update, context)
+
+
+async def group_restore(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str) -> None:
+    set_group_active(int(group_id), True)
+    await group_card(update, context, group_id)
+
+
+# ───────────────────────── Відвідуваність ─────────────────────────
+
+async def attendance_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    groups = get_all_groups()
+    if not groups:
+        await show(update, "Груп поки немає.")
+        return
+    if len(groups) == 1:
+        await attendance_view(update, context, str(groups[0]["id"]))
+        return
+    rows = [[btn(f"👥 {group['name']}", f"av:{group['id']}")] for group in groups]
+    await show(update, "📊 <b>Відвідуваність</b>\nОбери групу:", rows)
+
+
+def short_name(name: str, width: int = 12) -> str:
+    """'Іваненко Андрій' → 'Іваненко А.' якщо не влазить."""
+    if len(name) <= width:
+        return name
+    parts = name.split()
+    if len(parts) > 1:
+        candidate = f"{parts[0]} {parts[1][0]}."
+        if len(candidate) <= width:
+            return candidate
+    return name[:width - 1] + "…"
+
+
+def attendance_table(lessons, students, marks) -> tuple[str, int, int]:
+    """Таблиця моноширинним шрифтом: рядок — учень, стовпчик — заняття."""
+    width = max((len(short_name(s["name"])) for s in students), default=4)
+    days = [row["lesson_date"][8:10] for row in lessons]
+
+    lines = [
+        " " * (width + 1) + "".join(day[0] for day in days),
+        " " * (width + 1) + "".join(day[1] for day in days),
+    ]
+    present_total = marked_total = 0
+
+    for student in students:
+        cells = ""
+        present = marked = 0
+        for lesson in lessons:
+            status = marks.get((lesson["id"], student["id"]))
+            if status is None:
+                cells += "·"
+                continue
+            marked += 1
+            if status == "present":
+                present += 1
+                cells += "+"
+            else:
+                cells += "-"
+        present_total += present
+        marked_total += marked
+        lines.append(f"{short_name(student['name']).ljust(width)} {cells} {present}/{marked}")
+
+    return "\n".join(lines), present_total, marked_total
+
+
+async def attendance_view(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str, month: str = "") -> None:
+    group = get_group_by_id(int(group_id))
+    if not group:
+        await alert(update, "Групу не знайдено.")
+        return
+
+    month = month or current_month()
+    lessons, students, marks = get_group_attendance(group["id"], month)
+
+    text = f"📊 <b>{esc(group['name'])}</b> · {month_title(month)}\n"
+    rows = []
+
+    if lessons:
+        table, present, marked = attendance_table(lessons, students, marks)
+        percent = round(100 * present / marked) if marked else 0
+        text += (
+            f"Занять: {len(lessons)} · середня відвідуваність: {percent}%\n\n"
+            f"<pre>{esc(table)}</pre>\n"
+            "Зверху — число місяця (читай згори вниз).\n"
+            "+ був · - не був · «·» ще не був у групі\n\n"
+            "Натисни на дату, щоб відкрити заняття і виправити відмітки:"
+        )
+        date_buttons = [btn(fmt_date(row["lesson_date"], False), f"le:{row['id']}") for row in lessons]
+        rows += chunk(date_buttons, 4)
+    else:
+        text += "\nЗа цей місяць занять не було."
+
+    rows.append([
+        btn(f"◀ {MONTHS[int(shift_month(month, -1)[5:]) - 1]}", f"av:{group['id']}:{shift_month(month, -1)}"),
+        btn(f"{MONTHS[int(shift_month(month, 1)[5:]) - 1]} ▶", f"av:{group['id']}:{shift_month(month, 1)}"),
+    ])
+    if lessons:
+        rows.append([btn("📄 Таблиця файлом (Excel)", f"ax:{group['id']}:{month}")])
+    rows.append([btn("◀ Група", f"gc:{group['id']}")])
+
+    await show(update, text, rows)
+
+
+async def attendance_export(update: Update, context: ContextTypes.DEFAULT_TYPE, group_id: str, month: str) -> None:
+    group = get_group_by_id(int(group_id))
+    lessons, students, marks = get_group_attendance(int(group_id), month)
+    if not group or not lessons:
+        await alert(update, "Немає даних для експорту.")
+        return
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";")
+    writer.writerow(["Учень"] + [fmt_date(row["lesson_date"], False) for row in lessons] + ["Був", "Занять", "%"])
+    for student in students:
+        cells, present, marked = [], 0, 0
+        for lesson in lessons:
+            status = marks.get((lesson["id"], student["id"]))
+            if status is None:
+                cells.append("")
+                continue
+            marked += 1
+            present += status == "present"
+            cells.append("+" if status == "present" else "н")
+        percent = round(100 * present / marked) if marked else 0
+        writer.writerow([student["name"]] + cells + [present, marked, percent])
+
+    data = buffer.getvalue().encode("utf-8-sig")
+    safe_name = re.sub(r"[^\w\-]+", "_", group["name"]).strip("_") or "group"
+    await update.effective_chat.send_document(
+        document=data,
+        filename=f"vidviduvanist_{safe_name}_{month}.csv",
+        caption=f"Відвідуваність · {group['name']} · {month_title(month)}",
+    )
+
+
+# ───────────────────────── Баланси та звіт ─────────────────────────
+
 def build_summary_text() -> str:
-    individual_alerts = get_individual_payment_alerts()
-    grouped_alerts = get_grouped_payment_alerts()
-    debt_students = get_debt_students()
+    rows = get_low_balance_students(LOW_BALANCE)
+    if not rows:
+        return "⚠️ <b>Баланси</b>\n\nУсе добре: у всіх активних учнів є оплачені уроки."
 
-    text = "Загальне зведення по оплатах:\n\n"
+    sections = [
+        ("🔴 <b>Борг</b>", [r for r in rows if r["remaining_lessons"] < 0]),
+        ("🟠 <b>Уроки закінчились</b>", [r for r in rows if r["remaining_lessons"] == 0]),
+        ("🟡 <b>Залишився 1 урок</b>", [r for r in rows if r["remaining_lessons"] > 0]),
+    ]
 
-    if not individual_alerts and not grouped_alerts and not debt_students:
-        return text + "Проблемних учнів зараз немає."
-
-    if individual_alerts:
-        text += "Індивідуальні:\n"
-        for student in individual_alerts:
-            if student["remaining_lessons"] < 0:
-                text += f"- {student['name']} — борг {abs(student['remaining_lessons'])} урок(ів)\n"
-            elif student["remaining_lessons"] == 0:
-                text += f"- {student['name']} — уроки закінчились\n"
-            else:
-                text += f"- {student['name']} — залишився 1 урок\n"
-        text += "\n"
-
-    if grouped_alerts:
-        text += "Групи:\n"
-        for group_name, students in grouped_alerts.items():
-            text += f"\n{group_name}:\n"
-            for student in students:
-                if student["remaining_lessons"] < 0:
-                    text += f"- {student['name']} — борг {abs(student['remaining_lessons'])} урок(ів)\n"
-                elif student["remaining_lessons"] == 0:
-                    text += f"- {student['name']} — уроки закінчились\n"
-                else:
-                    text += f"- {student['name']} — залишився 1 урок\n"
-        text += "\n"
-
-    if debt_students:
-        text += "Боржники:\n"
-        for student in debt_students:
-            if student["student_type"] == "group":
-                text += f"- {student['name']} ({student['group_name']}) — борг {abs(student['remaining_lessons'])} урок(ів)\n"
-            else:
-                text += f"- {student['name']} — борг {abs(student['remaining_lessons'])} урок(ів)\n"
-
+    text = "⚠️ <b>Баланси</b>\n"
+    for title, items in sections:
+        if not items:
+            continue
+        text += f"\n{title}\n"
+        for row in sorted(items, key=lambda r: (name_key(r["group_name"] or "яяя"), name_key(r["name"]))):
+            place = row["group_name"] if row["student_type"] == "group" else "інд."
+            line = f"• {esc(row['name'])} ({esc(place or 'без групи')})"
+            if row["remaining_lessons"] < 0:
+                line += f" — {abs(row['remaining_lessons'])} ур."
+            elif row["remaining_lessons"] > 1:
+                line += f" — {row['remaining_lessons']}"
+            text += line + "\n"
     return text
 
 
-async def maybe_send_auto_reminders(app: Application):
-    enabled = get_setting("auto_reminders_enabled", "0")
-    admin_chat_id = get_setting("admin_chat_id", "")
-    hour = int(get_setting("auto_reminders_hour", "9"))
-    minute = int(get_setting("auto_reminders_minute", "0"))
-    last_date = get_setting("last_auto_reminder_date", "")
+async def balances(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show(update, build_summary_text(), [[btn("💳 Додати оплату", "P")]])
 
-    if enabled != "1":
+
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE, month: str = "") -> None:
+    month = month or current_month()
+    data = get_month_report(month)
+    totals = data["totals"]
+
+    text = (
+        f"📈 <b>Звіт · {month_title(month)}</b>\n\n"
+        f"💳 Оплат: {totals['payments_count']} на <b>{fmt_money(totals['amount'])} грн</b> "
+        f"({totals['lessons_paid']} ур.)\n"
+        f"✅ Занять: групових {data['lessons'].get('group', 0)}, "
+        f"індивідуальних {data['lessons'].get('individual', 0)}\n"
+        f"Списано уроків з балансів: {data['written_off']}\n"
+    )
+
+    if data["by_group"]:
+        text += "\n<b>Оплати по групах</b>\n"
+        for row in data["by_group"]:
+            text += f"• {esc(row['title'])} — {fmt_money(row['amount'])} грн ({row['payments_count']})\n"
+
+    if data["attendance"]:
+        text += "\n<b>Відвідуваність груп</b>\n"
+        for row in data["attendance"]:
+            percent = round(100 * row["present"] / row["total"]) if row["total"] else 0
+            text += f"• {esc(row['title'])} — занять {row['lessons_count']}, {percent}%\n"
+
+    rows = [[
+        btn(f"◀ {MONTHS[int(shift_month(month, -1)[5:]) - 1]}", f"R:{shift_month(month, -1)}"),
+        btn(f"{MONTHS[int(shift_month(month, 1)[5:]) - 1]} ▶", f"R:{shift_month(month, 1)}"),
+    ]]
+    await show(update, text, rows)
+
+
+# ───────────────────────── Налаштування, бекап, фонові задачі ─────────────────────────
+
+def ensure_default_settings() -> None:
+    defaults = {
+        "auto_reminders_enabled": "0",
+        "auto_reminders_hour": "09",
+        "auto_reminders_minute": "00",
+        "last_auto_reminder_date": "",
+        "weekly_backup_enabled": "1",
+        "last_backup_date": "",
+    }
+    for key, value in defaults.items():
+        if get_setting(key) is None:
+            set_setting(key, value)
+
+
+async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reminders = get_setting("auto_reminders_enabled", "0") == "1"
+    weekly = get_setting("weekly_backup_enabled", "1") == "1"
+    clock = f"{get_setting('auto_reminders_hour', '09')}:{get_setting('auto_reminders_minute', '00')}"
+    last_backup = get_setting("last_backup_date", "") or "ще не було"
+
+    text = (
+        "⚙️ <b>Налаштування</b>\n\n"
+        f"🔔 Щоденне зведення по балансах: <b>{'увімкнено' if reminders else 'вимкнено'}</b>, о {clock}\n"
+        f"💾 Щотижневий бекап у цей чат: <b>{'увімкнено' if weekly else 'вимкнено'}</b>\n"
+        f"Останній автобекап: {last_backup}"
+    )
+    rows = [
+        [btn(f"🔔 {'Вимкнути' if reminders else 'Увімкнути'} зведення", "tr"), btn("⏰ Змінити час", "tt")],
+        [btn(f"💾 {'Вимкнути' if weekly else 'Увімкнути'} автобекап", "tw")],
+        [btn("📥 Надіслати бекап бази зараз", "tb")],
+    ]
+    await show(update, text, rows)
+
+
+async def settings_toggle_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    enabled = get_setting("auto_reminders_enabled", "0") == "1"
+    set_setting("auto_reminders_enabled", "0" if enabled else "1")
+    await settings_menu(update, context)
+
+
+async def settings_toggle_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    enabled = get_setting("weekly_backup_enabled", "1") == "1"
+    set_setting("weekly_backup_enabled", "0" if enabled else "1")
+    await settings_menu(update, context)
+
+
+async def settings_time_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await ask_text(update, context, {"kind": "reminder_time"}, "О котрій надсилати зведення? Наприклад <code>09:30</code>", "T")
+
+
+async def send_backup(app: Application, chat_id: int, tag: str) -> None:
+    path = await asyncio.to_thread(backup_db, tag)
+    if not path:
+        await app.bot.send_message(chat_id, "Базу даних ще не створено.")
+        return
+    with open(path, "rb") as file:
+        await app.bot.send_document(
+            chat_id,
+            document=file,
+            filename=path.name,
+            caption=f"💾 Бекап бази · {now():%d.%m.%Y %H:%M}\nЗбережи цей файл — з нього можна відновити всі дані.",
+        )
+
+
+async def settings_backup_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_backup(context.application, update.effective_chat.id, "manual")
+
+
+async def background_tick(app: Application) -> None:
+    chat_id = report_chat_id()
+    if not chat_id:
         return
 
-    if not admin_chat_id:
-        return
+    current = now()
+    today = current.strftime("%Y-%m-%d")
 
-    now = get_local_now()
-    today_str = now.strftime("%Y-%m-%d")
+    if get_setting("auto_reminders_enabled", "0") == "1" and get_setting("last_auto_reminder_date", "") != today:
+        hour = int(get_setting("auto_reminders_hour", "9"))
+        minute = int(get_setting("auto_reminders_minute", "0"))
+        if (current.hour, current.minute) >= (hour, minute):
+            if get_low_balance_students(LOW_BALANCE):
+                await app.bot.send_message(chat_id, build_summary_text(), parse_mode=ParseMode.HTML)
+            set_setting("last_auto_reminder_date", today)
 
-    if last_date == today_str:
-        return
+    if get_setting("weekly_backup_enabled", "1") == "1" and current.hour >= 9:
+        last = get_setting("last_backup_date", "")
+        due = True
+        if last:
+            try:
+                due = (current.date() - date.fromisoformat(last)).days >= 7
+            except ValueError:
+                due = True
+        if due:
+            await send_backup(app, chat_id, "weekly")
+            set_setting("last_backup_date", today)
 
-    if now.hour < hour or (now.hour == hour and now.minute < minute):
-        return
 
-    text = build_summary_text()
-    await app.bot.send_message(chat_id=int(admin_chat_id), text=text)
-    set_setting("last_auto_reminder_date", today_str)
-
-
-async def auto_reminder_loop(app: Application):
+async def background_loop(app: Application) -> None:
     try:
         while True:
             try:
-                await maybe_send_auto_reminders(app)
+                await background_tick(app)
             except Exception:
-                logger.exception("Помилка під час автонагадувань")
+                logger.exception("Помилка у фоновій задачі")
             await asyncio.sleep(60)
     except asyncio.CancelledError:
-        logger.info("Фонову задачу автонагадувань зупинено")
+        logger.info("Фонову задачу зупинено")
         raise
 
 
-async def post_init(app: Application):
+async def post_init(app: Application) -> None:
     ensure_default_settings()
-    await app.bot.delete_webhook(drop_pending_updates=True)
-
-    auto_task = asyncio.create_task(auto_reminder_loop(app))
-    app.bot_data[AUTO_REMINDER_TASK_KEY] = auto_task
+    app.bot_data[BACKGROUND_TASK_KEY] = asyncio.create_task(background_loop(app))
 
 
-async def post_shutdown(app: Application):
-    auto_task = app.bot_data.get(AUTO_REMINDER_TASK_KEY)
-
-    if auto_task:
-        auto_task.cancel()
+async def post_shutdown(app: Application) -> None:
+    task = app.bot_data.get(BACKGROUND_TASK_KEY)
+    if task:
+        task.cancel()
         try:
-            await auto_task
+            await task
         except asyncio.CancelledError:
             pass
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    error = context.error
+# ───────────────────────── Обробка тексту ─────────────────────────
 
-    if isinstance(error, Conflict):
-        logger.warning("Тимчасовий Conflict під час polling. Ймовірно, накладення двох інстансів під час redeploy.")
-        return
-
-    logger.exception("Необроблена помилка в боті", exc_info=error)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    set_setting("admin_chat_id", str(chat_id))
-
-    await update.message.reply_text(
-        "Бот запущено. Обери розділ:",
-        reply_markup=get_main_menu_markup()
+async def reply(update: Update, text: str, rows=None) -> None:
+    await update.effective_chat.send_message(
+        text, reply_markup=markup(rows) if rows else None, parse_mode=ParseMode.HTML
     )
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text(
-        "Дію скасовано.",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def groups_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["Додати групу"],
-        ["Список груп"],
-        ["Назад"]
-    ]
-    await update.message.reply_text(
-        "Меню груп:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-
-
-async def students_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["Додати учня", "Список учнів"],
-        ["Картка учня", "Історія оплат"],
-        ["Змінити баланс", "Деактивувати учня"],
-        ["Перевести в групу", "Змінити розклад"],
-        ["Назад"]
-    ]
-    await update.message.reply_text(
-        "Меню учнів:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-
-
-async def payments_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["Додати оплату"],
-        ["Учні з малим залишком"],
-        ["Назад"]
-    ]
-    await update.message.reply_text(
-        "Меню оплат:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-
-
-async def lessons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["Індивідуальний урок"],
-        ["Групове заняття"],
-        ["Назад"]
-    ]
-    await update.message.reply_text(
-        "Меню уроків:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-
-
-async def reminders_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    enabled = get_setting("auto_reminders_enabled", "0")
-    hour = get_setting("auto_reminders_hour", "09")
-    minute = get_setting("auto_reminders_minute", "00")
-
-    status = "увімкнені" if enabled == "1" else "вимкнені"
-
-    keyboard = [
-        ["Загальне зведення"],
-        ["Індивідуальні нагадування", "Групові нагадування"],
-        ["Боржники"],
-        ["Увімкнути автонагадування", "Вимкнути автонагадування"],
-        ["Змінити час автонагадування"],
-        ["Назад"]
-    ]
-    await update.message.reply_text(
-        f"Меню нагадувань:\nАвтонагадування: {status}\nЧас: {hour}:{minute}",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-
-
-async def quick_actions_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["Сьогоднішні уроки"],
-        ["Швидка оплата"],
-        ["Швидке індивідуальне списання", "Швидке групове списання"],
-        ["Назад"]
-    ]
-    await update.message.reply_text(
-        "Швидкі дії:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-
-
-async def search_filters_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["Пошук учня", "Учні групи"],
-        ["Неактивні учні", "Проблемні баланси"],
-        ["Назад"]
-    ]
-    await update.message.reply_text(
-        "Пошук і фільтри:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-
-
-async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введи назву групи:",
-        reply_markup=get_cancel_markup()
-    )
-    return GROUP_NAME
-
-
-async def add_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["group_name"] = update.message.text
-    await update.message.reply_text(
-        "Введи день занять (наприклад: Понеділок):",
-        reply_markup=get_cancel_markup()
-    )
-    return GROUP_DAY
-
-
-async def add_group_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["group_day"] = update.message.text
-    await update.message.reply_text(
-        "Введи час занять (наприклад: 16:00):",
-        reply_markup=get_cancel_markup()
-    )
-    return GROUP_TIME
-
-
-async def add_group_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = context.user_data["group_name"]
-    day = context.user_data["group_day"]
-    time = update.message.text
-
-    create_group(name, day, time)
-
-    await update.message.reply_text(
-        f"Група створена:\n{name} — {day} {time}",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def list_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    groups = get_all_groups()
-
-    if not groups:
-        await update.message.reply_text("Груп поки немає")
-        return
-
-    text = "Список груп:\n\n"
-    for g in groups:
-        text += f"{g['id']}. {g['name']} — {g['lesson_day']} {g['lesson_time']}\n"
-
-    await update.message.reply_text(text)
-
-
-async def add_student_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["Індивідуальний"],
-        ["У групу"],
-        ["Скасувати", "Назад"]
-    ]
-    await update.message.reply_text(
-        "Оберіть тип учня:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-    return STUDENT_TYPE
-
-
-async def add_student_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    student_type = update.message.text
-
-    if student_type == "Індивідуальний":
-        context.user_data["student_type"] = "individual"
-        await update.message.reply_text(
-            "Введи ім'я учня:",
-            reply_markup=get_cancel_markup()
-        )
-        return STUDENT_NAME
-
-    if student_type == "У групу":
-        context.user_data["student_type"] = "group"
-        await update.message.reply_text(
-            "Введи ім'я учня:",
-            reply_markup=get_cancel_markup()
-        )
-        return STUDENT_NAME
-
-    if student_type in ("Назад", "Скасувати"):
-        return await cancel(update, context)
-
-    keyboard = [
-        ["Індивідуальний"],
-        ["У групу"],
-        ["Скасувати", "Назад"]
-    ]
-    await update.message.reply_text(
-        "Оберіть варіант кнопкою.",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-    return STUDENT_TYPE
-
-
-async def add_student_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["student_name"] = update.message.text
-    student_type = context.user_data["student_type"]
-
-    if student_type == "individual":
-        await update.message.reply_text(
-            "Введи день занять:",
-            reply_markup=get_cancel_markup()
-        )
-        return STUDENT_DAY
-
-    groups = get_all_groups()
-    if not groups:
-        await update.message.reply_text(
-            "Спочатку створи хоча б одну групу.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Оберіть групу за ID:\n\n"
-    for g in groups:
-        text += f"{g['id']}. {g['name']} — {g['lesson_day']} {g['lesson_time']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return STUDENT_GROUP
-
-
-async def add_student_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["student_day"] = update.message.text
-    await update.message.reply_text(
-        "Введи час занять:",
-        reply_markup=get_cancel_markup()
-    )
-    return STUDENT_TIME
-
-
-async def add_student_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    create_individual_student(
-        context.user_data["student_name"],
-        context.user_data["student_day"],
-        update.message.text
-    )
-    await update.message.reply_text(
-        "Індивідуального учня створено.",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def add_student_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        group_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID групи.",
-            reply_markup=get_cancel_markup()
-        )
-        return STUDENT_GROUP
-
-    groups = get_all_groups()
-    valid_group_ids = [g["id"] for g in groups]
-
-    if group_id not in valid_group_ids:
-        await update.message.reply_text(
-            "Такої групи немає.",
-            reply_markup=get_cancel_markup()
-        )
-        return STUDENT_GROUP
-
-    create_group_student(context.user_data["student_name"], group_id)
-    await update.message.reply_text(
-        "Учня додано в групу.",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def list_students(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_all_students()
-
-    if not students:
-        await update.message.reply_text("Учнів поки немає.")
-        return
-
-    text = "Список учнів:\n\n"
-    for student in students:
-        text += format_student_line(student) + "\n"
-
-    await update.message.reply_text(text)
-
-
-async def show_student_card_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_all_students()
-
-    if not students:
-        await update.message.reply_text(
-            "Учнів поки немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID учня для перегляду картки:\n\n"
-    for s in students:
-        text += f"{s['id']}. {s['name']} | Залишок: {s['remaining_lessons']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return CARD_STUDENT_ID
-
-
-async def show_student_card_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        student_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID учня.",
-            reply_markup=get_cancel_markup()
-        )
-        return CARD_STUDENT_ID
-
-    student = get_student_by_id(student_id)
-    if not student:
-        await update.message.reply_text(
-            "Учня не знайдено.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = f"Картка учня:\n\nID: {student['id']}\nІм'я: {student['name']}\nТип: {student['student_type']}\nСтатус: {'Активний' if student['is_active'] == 1 else 'Неактивний'}\n"
-
-    if student["student_type"] == "individual":
-        text += f"Розклад: {student['lesson_day']} {student['lesson_time']}\n"
-    else:
-        text += f"Група: {student['group_name']}\n"
-        text += f"Розклад групи: {student['group_lesson_day']} {student['group_lesson_time']}\n"
-
-    text += f"Залишок уроків: {student['remaining_lessons']}\n"
-    text += f"Остання оплата: {student['last_payment_date'] or '—'}\n"
-    text += f"Нотатки: {student['notes'] or '—'}"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def student_history_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_all_students(include_inactive=True)
-
-    if not students:
-        await update.message.reply_text(
-            "Учнів поки немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID учня для перегляду історії оплат:\n\n"
-    for s in students:
-        text += f"{s['id']}. {s['name']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return HISTORY_STUDENT_ID
-
-
-async def student_history_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        student_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID учня.",
-            reply_markup=get_cancel_markup()
-        )
-        return HISTORY_STUDENT_ID
-
-    student = get_student_by_id(student_id)
-    if not student:
-        await update.message.reply_text(
-            "Учня не знайдено.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    payments = get_payments_by_student(student_id)
-    if not payments:
-        await update.message.reply_text(
-            f"По учню {student['name']} оплат поки немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = f"Історія оплат: {student['name']}\n\n"
-    for payment in payments:
-        text += (
-            f"- {payment['payment_date']} | "
-            f"Сума: {payment['amount']} | "
-            f"Уроків: {payment['lessons_paid']}\n"
-        )
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def deactivate_student_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_all_students()
-
-    if not students:
-        await update.message.reply_text(
-            "Активних учнів немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID учня для деактивації:\n\n"
-    for s in students:
-        text += f"{s['id']}. {s['name']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return DEACTIVATE_STUDENT_ID
-
-
-async def deactivate_student_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        student_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID учня.",
-            reply_markup=get_cancel_markup()
-        )
-        return DEACTIVATE_STUDENT_ID
-
-    student = get_student_by_id(student_id)
-    if not student or student["is_active"] == 0:
-        await update.message.reply_text(
-            "Учня не знайдено.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    deactivate_student(student_id)
-    await update.message.reply_text(
-        f"Учня {student['name']} деактивовано.",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def update_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_all_students()
-
-    if not students:
-        await update.message.reply_text(
-            "Активних учнів немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID учня для зміни балансу:\n\n"
-    for s in students:
-        text += f"{s['id']}. {s['name']} | Поточний залишок: {s['remaining_lessons']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return BALANCE_STUDENT_ID
-
-
-async def update_balance_student(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        student_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID учня.",
-            reply_markup=get_cancel_markup()
-        )
-        return BALANCE_STUDENT_ID
-
-    student = get_student_by_id(student_id)
-    if not student or student["is_active"] == 0:
-        await update.message.reply_text(
-            "Учня не знайдено.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    context.user_data["balance_student_id"] = student_id
-    context.user_data["balance_student_name"] = student["name"]
-
-    await update.message.reply_text(
-        f"Введи новий баланс для {student['name']}.\nМожна вводити від'ємні значення.",
-        reply_markup=get_cancel_markup()
-    )
-    return BALANCE_NEW_VALUE
-
-
-async def update_balance_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        new_balance = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи ціле число.",
-            reply_markup=get_cancel_markup()
-        )
-        return BALANCE_NEW_VALUE
-
-    student_id = context.user_data["balance_student_id"]
-    student_name = context.user_data["balance_student_name"]
-
-    update_student_balance(student_id, new_balance)
-    await update.message.reply_text(
-        f"Баланс оновлено.\nУчень: {student_name}\nНовий залишок: {new_balance}",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def move_student_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_all_students()
-    groups = get_all_groups()
-
-    if not students:
-        await update.message.reply_text(
-            "Активних учнів немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    if not groups:
-        await update.message.reply_text(
-            "Спочатку створи хоча б одну групу.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID учня для переведення в групу:\n\n"
-    for s in students:
-        text += f"{s['id']}. {s['name']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return MOVE_STUDENT_ID
-
-
-async def move_student_choose_student(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        student_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID учня.",
-            reply_markup=get_cancel_markup()
-        )
-        return MOVE_STUDENT_ID
-
-    student = get_student_by_id(student_id)
-    if not student or student["is_active"] == 0:
-        await update.message.reply_text(
-            "Учня не знайдено.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    context.user_data["move_student_id"] = student_id
-    context.user_data["move_student_name"] = student["name"]
-
-    groups = get_all_groups()
-    text = "Введи ID групи, в яку треба перевести учня:\n\n"
-    for g in groups:
-        text += f"{g['id']}. {g['name']} | {g['lesson_day']} {g['lesson_time']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return MOVE_GROUP_ID
-
-
-async def move_student_choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        group_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID групи.",
-            reply_markup=get_cancel_markup()
-        )
-        return MOVE_GROUP_ID
-
-    groups = get_all_groups()
-    valid_group_ids = [g["id"] for g in groups]
-
-    if group_id not in valid_group_ids:
-        await update.message.reply_text(
-            "Такої групи немає.",
-            reply_markup=get_cancel_markup()
-        )
-        return MOVE_GROUP_ID
-
-    student_id = context.user_data["move_student_id"]
-    student_name = context.user_data["move_student_name"]
-
-    move_student_to_group(student_id, group_id)
-    group_name = next(g["name"] for g in groups if g["id"] == group_id)
-
-    await update.message.reply_text(
-        f"Учня переведено в групу.\nУчень: {student_name}\nГрупа: {group_name}",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_all_students()
-
-    if not students:
-        await update.message.reply_text(
-            "Активних учнів немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID учня для зміни розкладу:\n\n"
-    for s in students:
-        text += f"{s['id']}. {s['name']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return SCHEDULE_STUDENT_ID
-
-
-async def schedule_choose_student(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        student_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID учня.",
-            reply_markup=get_cancel_markup()
-        )
-        return SCHEDULE_STUDENT_ID
-
-    student = get_student_by_id(student_id)
-    if not student or student["is_active"] == 0:
-        await update.message.reply_text(
-            "Учня не знайдено.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    context.user_data["schedule_student_id"] = student_id
-    context.user_data["schedule_student_name"] = student["name"]
-
-    await update.message.reply_text(
-        "Введи новий день занять:",
-        reply_markup=get_cancel_markup()
-    )
-    return SCHEDULE_DAY
-
-
-async def schedule_choose_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["schedule_day"] = update.message.text
-    await update.message.reply_text(
-        "Введи новий час занять:",
-        reply_markup=get_cancel_markup()
-    )
-    return SCHEDULE_TIME
-
-
-async def schedule_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lesson_time = update.message.text
-    student_id = context.user_data["schedule_student_id"]
-    student_name = context.user_data["schedule_student_name"]
-    lesson_day = context.user_data["schedule_day"]
-
-    update_individual_schedule(student_id, lesson_day, lesson_time)
-
-    await update.message.reply_text(
-        f"Розклад оновлено.\nУчень: {student_name}\nНовий розклад: {lesson_day} {lesson_time}",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def add_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_all_students()
-
-    if not students:
-        await update.message.reply_text(
-            "Спочатку потрібно створити хоча б одного учня.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID учня для додавання оплати:\n\n"
-    for s in students:
-        text += format_student_line(s) + "\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return PAYMENT_STUDENT_ID
-
-
-async def add_payment_student_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        student_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID учня.",
-            reply_markup=get_cancel_markup()
-        )
-        return PAYMENT_STUDENT_ID
-
-    students = get_all_students()
-    valid_ids = [s["id"] for s in students]
-
-    if student_id not in valid_ids:
-        await update.message.reply_text(
-            "Такого учня немає.",
-            reply_markup=get_cancel_markup()
-        )
-        return PAYMENT_STUDENT_ID
-
-    context.user_data["payment_student_id"] = student_id
-    await update.message.reply_text(
-        "Введи суму оплати:",
-        reply_markup=get_cancel_markup()
-    )
-    return PAYMENT_AMOUNT
-
-
-async def add_payment_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        amount = float(update.message.text.replace(",", "."))
-    except ValueError:
-        await update.message.reply_text(
-            "Введи коректну суму.",
-            reply_markup=get_cancel_markup()
-        )
-        return PAYMENT_AMOUNT
-
-    if amount <= 0:
-        await update.message.reply_text(
-            "Сума має бути більшою за 0.",
-            reply_markup=get_cancel_markup()
-        )
-        return PAYMENT_AMOUNT
-
-    context.user_data["payment_amount"] = amount
-    await update.message.reply_text(
-        "Введи кількість оплачених уроків:",
-        reply_markup=get_cancel_markup()
-    )
-    return PAYMENT_LESSONS
-
-
-async def add_payment_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        lessons_paid = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи ціле число уроків.",
-            reply_markup=get_cancel_markup()
-        )
-        return PAYMENT_LESSONS
-
-    if lessons_paid <= 0:
-        await update.message.reply_text(
-            "Кількість уроків має бути більшою за 0.",
-            reply_markup=get_cancel_markup()
-        )
-        return PAYMENT_LESSONS
-
-    student_id = context.user_data["payment_student_id"]
-    amount = context.user_data["payment_amount"]
-
-    students = get_all_students()
-    student = next((s for s in students if s["id"] == student_id), None)
-
-    if not student:
-        await update.message.reply_text(
-            "Учня не знайдено.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    add_payment(student_id, amount, lessons_paid)
-    new_balance = student["remaining_lessons"] + lessons_paid
-
-    await update.message.reply_text(
-        f"Оплату додано:\n"
-        f"Учень: {student['name']}\n"
-        f"Сума: {amount}\n"
-        f"Уроків додано: {lessons_paid}\n"
-        f"Новий залишок: {new_balance}",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def low_balance_students(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_low_balance_students()
-
-    if not students:
-        await update.message.reply_text("У всіх учнів залишок більше 1 уроку.")
-        return
-
-    group_students = []
-    individual_students = []
-
-    for s in students:
-        if s["student_type"] == "group":
-            group_students.append(s)
+async def handle_awaited(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict, text: str) -> None:
+    kind = state["kind"]
+
+    def again() -> None:
+        context.user_data["await"] = state
+
+    if kind == "search":
+        await search_students(update, context, text, state.get("action", "card"))
+
+    elif kind == "pay":
+        numbers = re.findall(r"\d+(?:[.,]\d+)?", text)
+        if len(numbers) != 2:
+            again()
+            await reply(update, "Потрібно два числа: кількість уроків і сума. Наприклад: <code>8 2400</code>")
+            return
+        lessons_paid = int(float(numbers[0].replace(",", ".")))
+        amount = float(numbers[1].replace(",", "."))
+        if lessons_paid <= 0 or amount < 0:
+            again()
+            await reply(update, "Кількість уроків має бути більшою за 0.")
+            return
+        await payment_save(update, context, str(state["sid"]), str(lessons_paid), str(amount))
+
+    elif kind == "balance":
+        student = get_student_by_id(state["sid"])
+        compact = text.replace(" ", "").replace("−", "-").replace("–", "-")
+        if re.fullmatch(r"[+-]\d+", compact):
+            new_balance = student["remaining_lessons"] + int(compact)
+        elif re.fullmatch(r"=?-?\d+", compact):
+            new_balance = int(compact.lstrip("="))
         else:
-            individual_students.append(s)
+            again()
+            await reply(update, "Не зрозумів. Приклади: <code>+2</code>, <code>-1</code>, <code>5</code>, <code>=-2</code>")
+            return
+        old_balance = update_student_balance(state["sid"], new_balance, stamp(), "ручна зміна")
+        await reply(update, f"✏️ Баланс змінено: {old_balance} → <b>{new_balance}</b>")
+        await student_card(update, context, str(state["sid"]))
 
-    text = "Учні з малим залишком:\n\n"
+    elif kind == "rename_s":
+        rename_student(state["sid"], text)
+        await student_card(update, context, str(state["sid"]))
 
-    if individual_students:
-        text += "Індивідуальні:\n"
-        for s in individual_students:
-            text += f"- {s['name']} — залишок {s['remaining_lessons']}\n"
-        text += "\n"
+    elif kind == "note_s":
+        update_student_notes(state["sid"], "" if text == "-" else text)
+        await student_card(update, context, str(state["sid"]))
 
-    if group_students:
-        grouped = {}
-        for s in group_students:
-            group_name = s["group_name"] or "Без групи"
-            if group_name not in grouped:
-                grouped[group_name] = []
-            grouped[group_name].append(s)
-
-        text += "Групові:\n"
-        for group_name, members in grouped.items():
-            text += f"\n{group_name}:\n"
-            for s in members:
-                text += f"- {s['name']} — залишок {s['remaining_lessons']}\n"
-
-    await update.message.reply_text(text)
-
-
-async def start_individual_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_individual_students()
-
-    if not students:
-        await update.message.reply_text(
-            "Індивідуальних учнів поки немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID учня для проведення уроку:\n\n"
-    for s in students:
-        text += f"{s['id']}. {s['name']} | {s['lesson_day']} {s['lesson_time']} | Залишок: {s['remaining_lessons']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return LESSON_INDIVIDUAL_ID
-
-
-async def lesson_individual_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        student_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID учня.",
-            reply_markup=get_cancel_markup()
-        )
-        return LESSON_INDIVIDUAL_ID
-
-    students = get_individual_students()
-    valid_ids = [s["id"] for s in students]
-
-    if student_id not in valid_ids:
-        await update.message.reply_text(
-            "Такого індивідуального учня немає.",
-            reply_markup=get_cancel_markup()
-        )
-        return LESSON_INDIVIDUAL_ID
-
-    result = complete_individual_lesson(student_id)
-
-    if not result["success"]:
-        await update.message.reply_text(
-            result["message"],
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    extra = ""
-    if result["remaining_lessons"] == 1:
-        extra = "\nУвага: залишився 1 урок."
-    elif result["remaining_lessons"] == 0:
-        extra = "\nУвага: оплачені уроки закінчились."
-    elif result["remaining_lessons"] < 0:
-        extra = f"\nУвага: учень у боргу на {abs(result['remaining_lessons'])} урок(ів)."
-
-    await update.message.reply_text(
-        f"Урок проведено.\n"
-        f"Учень: {result['student_name']}\n"
-        f"Новий залишок: {result['remaining_lessons']}{extra}",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def start_group_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    groups = get_all_groups()
-
-    if not groups:
-        await update.message.reply_text(
-            "Груп поки немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID групи для проведення заняття:\n\n"
-    for g in groups:
-        text += f"{g['id']}. {g['name']} | {g['lesson_day']} {g['lesson_time']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return LESSON_GROUP_ID
-
-
-async def lesson_group_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        group_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID групи.",
-            reply_markup=get_cancel_markup()
-        )
-        return LESSON_GROUP_ID
-
-    groups = get_all_groups()
-    valid_group_ids = [g["id"] for g in groups]
-
-    if group_id not in valid_group_ids:
-        await update.message.reply_text(
-            "Такої групи немає.",
-            reply_markup=get_cancel_markup()
-        )
-        return LESSON_GROUP_ID
-
-    students = get_students_by_group_id(group_id)
-
-    if not students:
-        await update.message.reply_text(
-            "У цій групі поки немає учнів.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    context.user_data["lesson_group_id"] = group_id
-
-    text = "Введи ID учнів, які були присутні, через кому.\n\n"
-    for s in students:
-        text += f"{s['id']}. {s['name']} | Залишок: {s['remaining_lessons']}\n"
-
-    text += "\nПриклад: 2,3,5"
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return LESSON_GROUP_PRESENT
-
-
-async def lesson_group_present(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    group_id = context.user_data["lesson_group_id"]
-    students = get_students_by_group_id(group_id)
-    valid_ids = [s["id"] for s in students]
-
-    raw_input = update.message.text.strip()
-
-    try:
-        present_ids = [int(x.strip()) for x in raw_input.split(",") if x.strip()]
-    except ValueError:
-        await update.message.reply_text(
-            "Введи тільки ID через кому. Наприклад: 2,3,5",
-            reply_markup=get_cancel_markup()
-        )
-        return LESSON_GROUP_PRESENT
-
-    invalid_ids = [sid for sid in present_ids if sid not in valid_ids]
-    if invalid_ids:
-        await update.message.reply_text(
-            f"У цій групі немає учнів з ID: {', '.join(map(str, invalid_ids))}",
-            reply_markup=get_cancel_markup()
-        )
-        return LESSON_GROUP_PRESENT
-
-    result = complete_group_lesson(group_id, present_ids)
-
-    if not result["success"]:
-        await update.message.reply_text(
-            result["message"],
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = f"Групове заняття проведено.\nГрупа: {result['group_name']}\n\n"
-
-    if result["written_off_students"]:
-        text += "Списано урок:\n"
-        for name in result["written_off_students"]:
-            text += f"- {name}\n"
-        text += "\n"
-
-    if result["absent_students"]:
-        text += "Відсутні:\n"
-        for name in result["absent_students"]:
-            text += f"- {name}\n"
-        text += "\n"
-
-    if result["debt_students"]:
-        text += "Пішли в борг після заняття:\n"
-        for name in result["debt_students"]:
-            text += f"- {name}\n"
-        text += "\n"
-
-    alert_names = list(dict.fromkeys(result["low_balance"] + result["zero_balance"]))
-    if alert_names:
-        text += "Потрібна увага по оплаті:\n"
-        for name in alert_names:
-            if name in result["zero_balance"]:
-                text += f"- {name} — уроки закінчились\n"
-            elif name in result["low_balance"]:
-                text += f"- {name} — залишився 1 урок\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def reminders_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_summary_text())
-
-
-async def individual_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_individual_payment_alerts()
-
-    if not students:
-        await update.message.reply_text("По індивідуальних учнях нагадувань немає.")
-        return
-
-    text = "Індивідуальні нагадування:\n\n"
-    for student in students:
-        if student["remaining_lessons"] < 0:
-            text += f"- {student['name']} — борг {abs(student['remaining_lessons'])} урок(ів)\n"
-        elif student["remaining_lessons"] == 0:
-            text += f"- {student['name']} — уроки закінчились\n"
+    elif kind == "add_students":
+        names = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+        group_id = state.get("gid")
+        if group_id:
+            existing = {s["name"].casefold() for s in get_students_by_group_id(group_id)}
         else:
-            text += f"- {student['name']} — залишився 1 урок\n"
+            existing = {s["name"].casefold() for s in get_individual_students()}
 
-    await update.message.reply_text(text)
+        created, skipped = [], []
+        for name in names:
+            if name.casefold() in existing:
+                skipped.append(name)
+                continue
+            existing.add(name.casefold())
+            new_id = create_group_student(name, group_id) if group_id else create_individual_student(name)
+            created.append((new_id, name))
+
+        message = ""
+        if created:
+            message += f"➕ Додано ({len(created)}): " + ", ".join(esc(name) for _, name in created)
+        if skipped:
+            message += "\nВже є в списку, пропущено: " + ", ".join(esc(name) for name in skipped)
+
+        rows = [[btn(f"👤 {name}", f"sc:{new_id}")] for new_id, name in created[:8]]
+        rows.append([btn("➕ Додати ще", f"an:g{group_id}" if group_id else "an:i")])
+        if group_id:
+            rows.append([btn("◀ До групи", f"gc:{group_id}")])
+        elif created:
+            message += "\n\nВідкрий картку учня, щоб задати розклад і додати оплату."
+        await reply(update, message or "Не додано жодного учня.", rows)
+
+    elif kind == "add_group":
+        group_id = create_group(" ".join(text.split()))
+        await reply(update, "➕ Групу створено. Задай розклад і додай учнів:")
+        await group_card(update, context, str(group_id))
+
+    elif kind == "rename_g":
+        rename_group(state["gid"], " ".join(text.split()))
+        await group_card(update, context, str(state["gid"]))
+
+    elif kind == "sched_time":
+        lesson_time = parse_time(text)
+        if not lesson_time:
+            again()
+            await reply(update, "Не схоже на час. Введи у форматі <code>16:00</code>")
+            return
+        await schedule_save(update, context, lesson_time)
+
+    elif kind == "reminder_time":
+        value = parse_time(text)
+        if not value:
+            again()
+            await reply(update, "Не схоже на час. Введи у форматі <code>09:30</code>")
+            return
+        hour, minute = value.split(":")
+        set_setting("auto_reminders_hour", hour)
+        set_setting("auto_reminders_minute", minute)
+        set_setting("last_auto_reminder_date", "")
+        await settings_menu(update, context)
 
 
-async def group_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    grouped_alerts = get_grouped_payment_alerts()
-
-    if not grouped_alerts:
-        await update.message.reply_text("По групах нагадувань немає.")
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    if not text:
         return
 
-    text = "Групові нагадування:\n"
-    for group_name, students in grouped_alerts.items():
-        text += f"\n{group_name}:\n"
-        for student in students:
-            if student["remaining_lessons"] < 0:
-                text += f"- {student['name']} — борг {abs(student['remaining_lessons'])} урок(ів)\n"
-            elif student["remaining_lessons"] == 0:
-                text += f"- {student['name']} — уроки закінчились\n"
-            else:
-                text += f"- {student['name']} — залишився 1 урок\n"
-
-    await update.message.reply_text(text)
-
-
-async def debtors_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_debt_students()
-
-    if not students:
-        await update.message.reply_text("Боржників зараз немає.")
+    if text in MENU_ACTIONS:
+        context.user_data.pop("await", None)
+        context.user_data.pop("sched", None)
+        await MENU_ACTIONS[text](update, context)
         return
 
-    text = "Боржники:\n\n"
-    for student in students:
-        if student["student_type"] == "group":
-            text += f"- {student['name']} | {student['group_name']} | борг {abs(student['remaining_lessons'])} урок(ів)\n"
-        else:
-            text += f"- {student['name']} | Індивідуально | борг {abs(student['remaining_lessons'])} урок(ів)\n"
-
-    await update.message.reply_text(text)
-
-
-async def enable_auto_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_setting("auto_reminders_enabled", "1")
-    await update.message.reply_text("Автонагадування увімкнено.")
-
-
-async def disable_auto_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_setting("auto_reminders_enabled", "0")
-    await update.message.reply_text("Автонагадування вимкнено.")
-
-
-async def auto_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current_hour = get_setting("auto_reminders_hour", "09")
-    current_minute = get_setting("auto_reminders_minute", "00")
-    await update.message.reply_text(
-        f"Поточний час автонагадування: {current_hour}:{current_minute}\n"
-        f"Введи новий час у форматі HH:MM",
-        reply_markup=get_cancel_markup()
-    )
-    return AUTO_TIME_VALUE
-
-
-async def auto_time_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    value = update.message.text.strip()
-
-    try:
-        hour_str, minute_str = value.split(":")
-        hour = int(hour_str)
-        minute = int(minute_str)
-    except ValueError:
-        await update.message.reply_text(
-            "Неправильний формат. Введи так: 09:30",
-            reply_markup=get_cancel_markup()
-        )
-        return AUTO_TIME_VALUE
-
-    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-        await update.message.reply_text(
-            "Години мають бути 0-23, хвилини 0-59.",
-            reply_markup=get_cancel_markup()
-        )
-        return AUTO_TIME_VALUE
-
-    set_setting("auto_reminders_hour", f"{hour:02d}")
-    set_setting("auto_reminders_minute", f"{minute:02d}")
-
-    await update.message.reply_text(
-        f"Час автонагадування змінено на {hour:02d}:{minute:02d}",
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def today_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_idx = get_local_now().weekday()
-
-    individuals = []
-    groups_today = []
-
-    for student in get_all_students():
-        if student["student_type"] == "individual":
-            if normalize_weekday(student["lesson_day"]) == today_idx:
-                individuals.append(student)
-
-    for group in get_all_groups():
-        if normalize_weekday(group["lesson_day"]) == today_idx:
-            groups_today.append(group)
-
-    if not individuals and not groups_today:
-        await update.message.reply_text("Сьогодні запланованих уроків не знайдено.")
-        return
-
-    text = "Сьогоднішні уроки:\n\n"
-
-    if individuals:
-        text += "Індивідуальні:\n"
-        for student in individuals:
-            text += f"- {student['name']} — {student['lesson_time']} | залишок {student['remaining_lessons']}\n"
-        text += "\n"
-
-    if groups_today:
-        text += "Групи:\n"
-        for group in groups_today:
-            members = get_students_by_group_id(group["id"])
-            text += f"- {group['name']} — {group['lesson_time']} | учнів: {len(members)}\n"
-
-    await update.message.reply_text(text)
-
-
-async def search_student_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введи ім'я або частину імені для пошуку:",
-        reply_markup=get_cancel_markup()
-    )
-    return SEARCH_NAME_QUERY
-
-
-async def search_student_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query_text = update.message.text.strip()
-
-    if not query_text:
-        await update.message.reply_text(
-            "Порожній запит.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    students = search_students_by_name(query_text)
-
-    if not students:
-        await update.message.reply_text(
-            "Нічого не знайдено.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = f"Результати пошуку: {query_text}\n\n"
-    for student in students:
-        status = "Активний" if student["is_active"] == 1 else "Неактивний"
-        if student["student_type"] == "individual":
-            text += (
-                f"{student['id']}. {student['name']} | {status} | "
-                f"Індивідуально | {student['lesson_day']} {student['lesson_time']} | "
-                f"Залишок: {student['remaining_lessons']}\n"
-            )
-        else:
-            text += (
-                f"{student['id']}. {student['name']} | {status} | "
-                f"Група: {student['group_name']} | "
-                f"Залишок: {student['remaining_lessons']}\n"
-            )
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def filter_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    groups = get_all_groups()
-
-    if not groups:
-        await update.message.reply_text(
-            "Груп поки немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = "Введи ID групи:\n\n"
-    for g in groups:
-        text += f"{g['id']}. {g['name']} | {g['lesson_day']} {g['lesson_time']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_cancel_markup()
-    )
-    return FILTER_GROUP_ID
-
-
-async def filter_group_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        group_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Введи числовий ID групи.",
-            reply_markup=get_cancel_markup()
-        )
-        return FILTER_GROUP_ID
-
-    group = get_group_by_id(group_id)
-    if not group:
-        await update.message.reply_text(
-            "Такої групи немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    students = get_students_by_group_id(group_id)
-
-    if not students:
-        await update.message.reply_text(
-            f"У групі {group['name']} активних учнів немає.",
-            reply_markup=get_main_menu_markup()
-        )
-        return ConversationHandler.END
-
-    text = f"Учні групи {group['name']}:\n\n"
-    for student in students:
-        text += f"- {student['id']}. {student['name']} | Залишок: {student['remaining_lessons']}\n"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=get_main_menu_markup()
-    )
-    return ConversationHandler.END
-
-
-async def inactive_students_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    students = get_inactive_students()
-
-    if not students:
-        await update.message.reply_text("Неактивних учнів немає.")
-        return
-
-    text = "Неактивні учні:\n\n"
-    for student in students:
-        if student["student_type"] == "group":
-            text += f"- {student['id']}. {student['name']} | Група: {student['group_name']} | Залишок: {student['remaining_lessons']}\n"
-        else:
-            text += f"- {student['id']}. {student['name']} | Індивідуально | Залишок: {student['remaining_lessons']}\n"
-
-    await update.message.reply_text(text)
-
-
-async def problem_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_summary_text())
-
-
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-
-    if text == "Групи":
-        await groups_menu(update, context)
-    elif text == "Список груп":
-        await list_groups(update, context)
-
-    elif text == "Учні":
-        await students_menu(update, context)
-    elif text == "Список учнів":
-        await list_students(update, context)
-
-    elif text == "Оплати":
-        await payments_menu(update, context)
-    elif text == "Учні з малим залишком":
-        await low_balance_students(update, context)
-
-    elif text == "Уроки":
-        await lessons_menu(update, context)
-
-    elif text == "Нагадування":
-        await reminders_menu(update, context)
-    elif text == "Загальне зведення":
-        await reminders_summary(update, context)
-    elif text == "Індивідуальні нагадування":
-        await individual_reminders(update, context)
-    elif text == "Групові нагадування":
-        await group_reminders(update, context)
-    elif text == "Боржники":
-        await debtors_list(update, context)
-    elif text == "Увімкнути автонагадування":
-        await enable_auto_reminders(update, context)
-    elif text == "Вимкнути автонагадування":
-        await disable_auto_reminders(update, context)
-
-    elif text == "Швидкі дії":
-        await quick_actions_menu(update, context)
-    elif text == "Сьогоднішні уроки":
-        await today_lessons(update, context)
-
-    elif text == "Пошук і фільтри":
-        await search_filters_menu(update, context)
-    elif text == "Неактивні учні":
-        await inactive_students_list(update, context)
-    elif text == "Проблемні баланси":
-        await problem_balances(update, context)
-
-    elif text in ("Назад", "Скасувати"):
+    if text in OLD_BUTTONS:
         await start(update, context)
+        return
+
+    state = context.user_data.pop("await", None)
+    if state:
+        await handle_awaited(update, context, state, text)
+    else:
+        await search_students(update, context, text)
 
 
-def get_common_fallbacks():
-    return [
-        MessageHandler(filters.Regex(CANCEL_PATTERN), cancel)
-    ]
+# ───────────────────────── Маршрутизація кнопок ─────────────────────────
+
+async def menu_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await picker(update, context, "pay")
 
 
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN не знайдено")
+async def menu_students(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await picker(update, context, "card")
 
-    init_db()
-    ensure_default_settings()
 
+async def schedule_keep_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await schedule_save(update, context)
+
+
+MENU_ACTIONS = {
+    "✅ Провести урок": lesson_hub,
+    "💳 Оплата": menu_payment,
+    "👥 Учні": menu_students,
+    "🗂 Групи": groups_list,
+    "📊 Відвідуваність": attendance_menu,
+    "⚠️ Баланси": balances,
+    "📈 Звіт": report,
+    "⚙️ Налаштування": settings_menu,
+}
+
+ROUTES = {
+    # уроки
+    "L": lesson_hub,
+    "gl": group_lesson_start,
+    "gt": group_lesson_toggle,
+    "ga": group_lesson_all,
+    "gd": group_lesson_dates,
+    "gD": group_lesson_set_date,
+    "gb": group_lesson_render,
+    "gs": group_lesson_save,
+    "il": individual_lesson,
+    "le": lesson_view,
+    "lt": lesson_toggle,
+    "ul": lesson_cancel_confirm,
+    "uL": lesson_cancel,
+    # оплати
+    "P": menu_payment,
+    "ps": payment_packages,
+    "pm": payment_manual,
+    "pa": payment_save,
+    "up": payment_cancel_confirm,
+    "uP": payment_cancel,
+    # учні
+    "pk": picker,
+    "sc": student_card,
+    "sh": student_history,
+    "sb": student_balance_ask,
+    "sn": student_rename_ask,
+    "so": student_note_ask,
+    "sd": student_deactivate_confirm,
+    "sD": student_deactivate,
+    "sa": student_activate,
+    "sm": student_move_menu,
+    "sM": student_move,
+    "ss": schedule_student,
+    "as": add_student_menu,
+    "an": add_student_ask,
+    # розклад
+    "dy": schedule_toggle,
+    "dY": schedule_time_ask,
+    "dK": schedule_keep_time,
+    # групи
+    "G": groups_list,
+    "gc": group_card,
+    "gy": schedule_group,
+    "gn": group_rename_ask,
+    "gx": group_archive_confirm,
+    "gX": group_archive,
+    "gr": group_restore,
+    "ag": group_add_ask,
+    # відвідуваність, звіт
+    "av": attendance_view,
+    "ax": attendance_export,
+    "R": report,
+    # налаштування
+    "T": settings_menu,
+    "tr": settings_toggle_reminders,
+    "tw": settings_toggle_backup,
+    "tt": settings_time_ask,
+    "tb": settings_backup_now,
+}
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    action, *args = (query.data or "").split(":")
+    handler = ROUTES.get(action)
+
+    try:
+        if handler:
+            context.user_data.pop("await", None)
+            await handler(update, context, *args)
+    finally:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        # Railway під час redeploy кілька секунд тримає дві копії бота одночасно.
+        logger.warning("Тимчасовий Conflict під час polling (накладення двох інстансів при redeploy).")
+        return
+
+    logger.exception("Помилка під час обробки оновлення", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await update.effective_chat.send_message(
+                "Сталася помилка, дію не виконано. Спробуй ще раз або натисни /start."
+            )
+        except Exception:
+            pass
+
+
+def build_application() -> Application:
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1696,159 +1793,23 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-
-    group_conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Додати групу$"), add_group_start)],
-        states={
-            GROUP_NAME: [MessageHandler(TEXT_INPUT_FILTER, add_group_name)],
-            GROUP_DAY: [MessageHandler(TEXT_INPUT_FILTER, add_group_day)],
-            GROUP_TIME: [MessageHandler(TEXT_INPUT_FILTER, add_group_time)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    student_conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Додати учня$"), add_student_start)],
-        states={
-            STUDENT_TYPE: [MessageHandler(TEXT_INPUT_FILTER, add_student_type)],
-            STUDENT_NAME: [MessageHandler(TEXT_INPUT_FILTER, add_student_name)],
-            STUDENT_DAY: [MessageHandler(TEXT_INPUT_FILTER, add_student_day)],
-            STUDENT_TIME: [MessageHandler(TEXT_INPUT_FILTER, add_student_time)],
-            STUDENT_GROUP: [MessageHandler(TEXT_INPUT_FILTER, add_student_group)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    payment_conv_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.TEXT & filters.Regex("^Додати оплату$"), add_payment_start),
-            MessageHandler(filters.TEXT & filters.Regex("^Швидка оплата$"), add_payment_start),
-        ],
-        states={
-            PAYMENT_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, add_payment_student_id)],
-            PAYMENT_AMOUNT: [MessageHandler(TEXT_INPUT_FILTER, add_payment_amount)],
-            PAYMENT_LESSONS: [MessageHandler(TEXT_INPUT_FILTER, add_payment_lessons)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    individual_lesson_conv_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.TEXT & filters.Regex("^Індивідуальний урок$"), start_individual_lesson),
-            MessageHandler(filters.TEXT & filters.Regex("^Швидке індивідуальне списання$"), start_individual_lesson),
-        ],
-        states={
-            LESSON_INDIVIDUAL_ID: [MessageHandler(TEXT_INPUT_FILTER, lesson_individual_complete)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    group_lesson_conv_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.TEXT & filters.Regex("^Групове заняття$"), start_group_lesson),
-            MessageHandler(filters.TEXT & filters.Regex("^Швидке групове списання$"), start_group_lesson),
-        ],
-        states={
-            LESSON_GROUP_ID: [MessageHandler(TEXT_INPUT_FILTER, lesson_group_choose)],
-            LESSON_GROUP_PRESENT: [MessageHandler(TEXT_INPUT_FILTER, lesson_group_present)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    card_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Картка учня$"), show_student_card_start)],
-        states={
-            CARD_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, show_student_card_finish)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    history_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Історія оплат$"), student_history_start)],
-        states={
-            HISTORY_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, student_history_finish)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    deactivate_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Деактивувати учня$"), deactivate_student_start)],
-        states={
-            DEACTIVATE_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, deactivate_student_finish)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    balance_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Змінити баланс$"), update_balance_start)],
-        states={
-            BALANCE_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, update_balance_student)],
-            BALANCE_NEW_VALUE: [MessageHandler(TEXT_INPUT_FILTER, update_balance_finish)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    move_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Перевести в групу$"), move_student_start)],
-        states={
-            MOVE_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, move_student_choose_student)],
-            MOVE_GROUP_ID: [MessageHandler(TEXT_INPUT_FILTER, move_student_choose_group)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    schedule_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Змінити розклад$"), schedule_start)],
-        states={
-            SCHEDULE_STUDENT_ID: [MessageHandler(TEXT_INPUT_FILTER, schedule_choose_student)],
-            SCHEDULE_DAY: [MessageHandler(TEXT_INPUT_FILTER, schedule_choose_day)],
-            SCHEDULE_TIME: [MessageHandler(TEXT_INPUT_FILTER, schedule_finish)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    search_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Пошук учня$"), search_student_start)],
-        states={
-            SEARCH_NAME_QUERY: [MessageHandler(TEXT_INPUT_FILTER, search_student_finish)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    filter_group_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Учні групи$"), filter_group_start)],
-        states={
-            FILTER_GROUP_ID: [MessageHandler(TEXT_INPUT_FILTER, filter_group_finish)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    auto_time_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & filters.Regex("^Змінити час автонагадування$"), auto_time_start)],
-        states={
-            AUTO_TIME_VALUE: [MessageHandler(TEXT_INPUT_FILTER, auto_time_finish)],
-        },
-        fallbacks=get_common_fallbacks()
-    )
-
-    app.add_error_handler(error_handler)
+    app.add_handler(TypeHandler(Update, guard), group=-1)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(group_conv_handler)
-    app.add_handler(student_conv_handler)
-    app.add_handler(payment_conv_handler)
-    app.add_handler(individual_lesson_conv_handler)
-    app.add_handler(group_lesson_conv_handler)
-    app.add_handler(card_handler)
-    app.add_handler(history_handler)
-    app.add_handler(deactivate_handler)
-    app.add_handler(balance_handler)
-    app.add_handler(move_handler)
-    app.add_handler(schedule_handler)
-    app.add_handler(search_handler)
-    app.add_handler(filter_group_handler)
-    app.add_handler(auto_time_handler)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+    return app
 
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN не знайдено")
+
+    init_db()
+    ensure_default_settings()
+
+    app = build_application()
     print("Bot is running...")
     app.run_polling(drop_pending_updates=True)
 
